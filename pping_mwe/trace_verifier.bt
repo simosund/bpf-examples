@@ -1,0 +1,16 @@
+#include <linux/bpf_verifier.h>
+#include <linux/bpf.h>
+
+k:do_check
+{
+	@env_ptr = arg0;
+}
+
+kr:do_check
+{
+	$env = (struct bpf_verifier_env *)@env_ptr;
+	/* $prog = (struct bpf_prog *)$env->prog; */
+	/* printf("End: id: %u, type: %d, len: %u\n", $prog->aux->id, $prog->type, $prog->len); */
+	printf("Verifier end: insn: %u, jumps: %u, states: %u\n", $env->insn_processed, $env->jmps_processed, $env->peak_states);
+	delete(@env_ptr);
+}
