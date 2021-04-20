@@ -7,6 +7,7 @@ k:do_check
 }
 
 kr:do_check
+/@env_ptr != 0/
 {
 	$env = (struct bpf_verifier_env *)@env_ptr;
 	/* $prog = (struct bpf_prog *)$env->prog; */

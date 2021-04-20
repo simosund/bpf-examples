@@ -18,6 +18,8 @@
 #define INCLUDE_TCP_TS_PARSING //undefine to skip parsing the TCP options
 #define INCLUDE_IPV6SUPPORT    //undefine to remove IPv6 code path
 #define INCLUDE_SOUREDEST_SWAP //undefine to remove the logic that swaps source and dest for ingress
+#define INCLUDE_INGRESS        //undefine to remove the ingress/XDP program
+#define INCLUDE_EGRESS         //undefine to remove the egress/tc program
 
 char _license[] SEC("license") = "GPL";
 
@@ -387,6 +389,7 @@ static int parse_packet_identifier(struct parsing_context *ctx,
 
 // Programs
 
+#ifdef INCLUDE_INGRESS
 // XDP program for parsing identifier in ingress traffic and check for match in map
 SEC("xdp")
 int pping_ingress(struct xdp_md *ctx)
@@ -407,8 +410,9 @@ int pping_ingress(struct xdp_md *ctx)
 out:
 	return XDP_PASS;
 }
+#endif
 
-
+#ifdef INCLUDE_EGRESS
 // TC-BFP for parsing packet identifier from egress traffic and add to map
 SEC("classifier")
 int pping_egress(struct __sk_buff *skb)
@@ -429,3 +433,4 @@ int pping_egress(struct __sk_buff *skb)
 out:
 	return BPF_OK;
 }
+#endif
