@@ -104,7 +104,11 @@ Based on these results, I've drawn the following conclusions:
   files but forces the compiler to not inline the call (by adding
   `__attribute__((noinline))` to `parse_packet_identifier()`), then
   one will get identical results as when the programs are kept in the
-  same file.
+  same file. When keeping both programs in the same file it doesn't
+  seem possible to actually get the `parse_packet_identifier()`
+  function inlined, as even if it's declared as `__always_inline`, the
+  compiler will still generate BPF bytecode where it's called as a
+  function.
 
 - I've also found that the logic in `parse_packet_identifier()` that
   swaps the saddr and daddr for ingress causes the tc program to
@@ -123,6 +127,27 @@ Based on these results, I've drawn the following conclusions:
   down from 599k to 381k processed instructions), but is not enough to
   get the tc program down to under 1 million processed instructions.
 
+## Solutions
+There are a few simple solutions that can be employed for now, however
+as the program grows more complex in the future this problem might
+reappear.
+
+- Separate the two BPF programs into different files again. The main
+  drawback with this is that it makes the loading slight more
+  complicated and requires reverting back to multiple files for the
+  BPF code.
+
+- Reduce the maximum number of IPv6 extensions parsed (i.e. lower
+  `IPV6_EXT_MAX_CHAIN`). From what I've gathered IPv6 extensions are
+  very unusual in the wild, so reducing the number of extensions
+  parsed to ex 3 should not be much of a limitation.
+
+- Reduce the maximum number of TCP options parsed (i.e. lower
+  `MAX_TCP_OPTIONS`). I think it's quite unusual with packets that
+  would require 10 options to be parsed to find the TCP
+  timestamp. However, while 10 "actual" options are very unlikely, the
+  "NOP" option may be used for alignment of other options and may
+  therefore add a bit to the count.
 
 ## Files
 - **pping_kern.c:** The "standalone" (except all the linux and libbpf
