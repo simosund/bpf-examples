@@ -41,7 +41,7 @@ instructions can still be rejected if there are many potential
 branches.
 
 To find what seems to cause the verifier to process over 1 million
-instructions for seemingly relatively simple pping program, I've tried
+instructions for the seemingly relatively simple pping program, I've tried
 to strip out most parts of the program that don't seem to have a large
 effect on the number of instructions the verifier needs to
 process. I've then further studied how removing certain parts of the
@@ -133,7 +133,7 @@ as the program grows more complex in the future this problem might
 reappear.
 
 - Separate the two BPF programs into different files again. The main
-  drawback with this is that it makes the loading slight more
+  drawback with this is that it makes the loading slightly more
   complicated and requires reverting back to multiple files for the
   BPF code.
 
@@ -168,3 +168,18 @@ reappear.
   central `do_check()` function of the verifier and prints out a
   couple of metrics from it, the primary one being the number of
   instructions processed.
+
+## Environment
+The system I've tested this on runs Ubuntu 20.10 with kernel version
+5.8, and the code has been compiled using clang/LLVM 11.0.
+
+```
+$ uname -r
+5.8.0-50-generic
+
+$ clang --version
+Ubuntu clang version 11.0.0-2
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+InstalledDir: /usr/bin
+```
