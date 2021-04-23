@@ -71,6 +71,7 @@ them).
 | No swap saddr/daddr           |     603k |    603k |
 | No \__always_inline           |     599k |    > 1m |
 | noinline for loop funcs.      |     381k |    > 1m |
+| Compile with -mcpu=probe      |     588k |    > 1m |
 | Separate files + no TCP opts. |      14k |     13k |
 | Separate files + no IPv6      |       9k |     8 k |
 | Separate files + no swap      |     462k |    461k |
@@ -149,6 +150,26 @@ reappear.
   "NOP" option may be used for alignment of other options and may
   therefore add a bit to the count.
 
+Additional solutions from eBPF slack discussion:
+- Use function-by-function verification. This seems to be a rather
+  recent addition (introduced in 5.6 kernel), that if I understand it
+  correctly allows the verifier to verify each function independently
+  from the others, which should help avoiding some of these
+  combinatorial issues. In practice this is simply achieved by using
+  global rather than static functions? For now though, it doesn't seem
+  to support pointers, so can't use it on most of my functions (as
+  they typically take a pointer to the `parsing_context` struct or
+  similar).
+
+- Use a different eBPF instruction set. These can be specified by
+  passing the `-mcpu` and `-mattr` to `llc`. Cilium seems to recommend
+  using `-mcpu=probe`.
+
+- Compile with different versions of LLVM. Currently using LLVM 11,
+  but can apparently get some differences with ex LLVM 10 and LLVM 12.
+
+- Brake up program into multiple parts and use BPF tail calls.
+
 ## Files
 - **pping_kern.c:** The "standalone" (except all the linux and libbpf
   imports) BPF-program code stripped down to the parts that seem to be
@@ -183,3 +204,8 @@ Target: x86_64-pc-linux-gnu
 Thread model: posix
 InstalledDir: /usr/bin
 ```
+
+## Resources
+
+- [eBPF Slack discussion](https://cilium.slack.com/archives/C4XCTGYEM/p1619101486386100)
+- [Blog post](https://pchaigno.github.io/ebpf/2021/04/12/bmc-accelerating-memcached-using-bpf-and-xdp.html#bpfs-complexity-constraint) on the verifier's complexity constraint
