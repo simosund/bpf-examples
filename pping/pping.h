@@ -10,6 +10,14 @@
 #define SEC_INGRESS_TC "classifier/ingress"
 #define SEC_EGRESS_TC "classifier/egress"
 
+#define NS_PER_SECOND 1000000000UL
+#define NS_PER_MS 1000000UL
+
+#define TIMESTAMP_LIFETIME                                                     \
+	(10 * NS_PER_SECOND) // Clear out packet timestamps if they're over 10 seconds
+#define FLOW_LIFETIME                                                          \
+	(300 * NS_PER_SECOND) // Clear out flows if they're inactive over 300 seconds
+
 typedef __u64 fixpoint64;
 #define FIXPOINT_SHIFT 16
 #define DOUBLE_TO_FIXPOINT(X) ((fixpoint64)((X) * (1UL << FIXPOINT_SHIFT)))
@@ -38,6 +46,7 @@ enum __attribute__((__packed__)) flow_event_reason {
 enum __attribute__((__packed__)) flow_event_source {
 	EVENT_SOURCE_PKT_SRC,
 	EVENT_SOURCE_PKT_DEST,
+	EVENT_SOURCE_GC,
 	EVENT_SOURCE_USERSPACE
 };
 
@@ -143,17 +152,5 @@ union pping_event {
 	struct rtt_event rtt_event;
 	struct flow_event flow_event;
 };
-
-/*
- * Copies the src to dest, but swapping place on saddr and daddr
- */
-static void reverse_flow(struct network_tuple *dest, struct network_tuple *src)
-{
-	dest->ipv = src->ipv;
-	dest->proto = src->proto;
-	dest->saddr = src->daddr;
-	dest->daddr = src->saddr;
-	dest->reserved = 0;
-}
 
 #endif

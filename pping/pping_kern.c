@@ -28,6 +28,23 @@
 #define IPV6_FLOWINFO_MASK __cpu_to_be32(0x0FFFFFFF)
 
 /*
+ * Structs for map iteration programs
+ * Copied from /tools/testing/selftest/bpf/progs/bpf_iter.h
+ */
+struct bpf_iter_meta {
+	struct seq_file *seq;
+	__u64 session_id;
+	__u64 seq_num;
+} __attribute__((preserve_access_index));
+
+struct bpf_iter__bpf_map_elem {
+	struct bpf_iter_meta *meta;
+	struct bpf_map *map;
+	void *key;
+	void *value;
+};
+
+/*
  * This struct keeps track of the data and data_end pointers from the xdp_md or
  * __skb_buff contexts, as well as a currently parsed to position kept in nh.
  * Additionally, it also keeps the length of the entire packet, which together
@@ -120,6 +137,18 @@ static __u32 remaining_pkt_payload(struct parsing_context *ctx)
 	// data + pkt_len - pos fails on (data+pkt_len) - pos due to math between pkt_pointer and unbounded register
 	__u32 parsed_bytes = ctx->nh.pos - ctx->data;
 	return parsed_bytes < ctx->pkt_len ? ctx->pkt_len - parsed_bytes : 0;
+}
+
+/*
+ * Copies the src to dest, but swapping place on saddr and daddr
+ */
+static void reverse_flow(struct network_tuple *dest, struct network_tuple *src)
+{
+	dest->ipv = src->ipv;
+	dest->proto = src->proto;
+	dest->saddr = src->daddr;
+	dest->daddr = src->saddr;
+	dest->reserved = 0;
 }
 
 /*
@@ -714,4 +743,55 @@ int pping_xdp_ingress(struct xdp_md *ctx)
 	pping(ctx, &pctx);
 
 	return XDP_PASS;
+}
+
+SEC("iter/bpf_map_elem")
+int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
+{
+	struct packet_id key_copy;
+	struct packet_id *pid = ctx->key;
+	__u64 *timestamp = ctx->value;
+	__u64 now = bpf_ktime_get_ns();
+
+	if (!pid || !timestamp)
+		return 0;
+
+	if (now > *timestamp && now - *timestamp > TIMESTAMP_LIFETIME) {
+		__builtin_memcpy(&key_copy, pid, sizeof(key_copy));
+		bpf_map_delete_elem(&packet_ts, &key_copy);
+	}
+
+	return 0;
+}
+
+SEC("iter/bpf_map_elem")
+int flowmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
+{
+	struct network_tuple key_copy;
+	struct network_tuple *flow = ctx->key;
+	struct flow_state *f_state = ctx->value;
+	struct flow_event fe;
+	__u64 now = bpf_ktime_get_ns();
+
+	if (!flow || !f_state)
+		return 0;
+
+	if (now > f_state->last_timestamp &&
+	    now - f_state->last_timestamp > FLOW_LIFETIME) {
+		__builtin_memcpy(&key_copy, flow, sizeof(key_copy));
+		if (f_state->has_opened &&
+		    bpf_map_delete_elem(&flow_state, &key_copy) == 0) {
+			reverse_flow(&fe.flow, &key_copy);
+			fe.event_type = EVENT_TYPE_FLOW;
+			fe.timestamp = now;
+			fe.flow_event_type = FLOW_EVENT_CLOSING;
+			fe.reason = EVENT_REASON_FLOW_TIMEOUT;
+			fe.source = EVENT_SOURCE_GC;
+			fe.reserved = 0;
+			bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
+					      &fe, sizeof(fe));
+		}
+	}
+
+	return 0;
 }
