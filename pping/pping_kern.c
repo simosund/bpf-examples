@@ -100,7 +100,7 @@ static volatile const struct bpf_config config = {};
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct packet_id);
-	__type(value, __u64);
+	__type(value, struct packet_timestamp);
 	__uint(max_entries, 16384);
 } packet_ts SEC(".maps");
 
@@ -604,6 +604,8 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 				   struct parsing_context *pctx,
 				   struct packet_info *p_info, bool new_flow)
 {
+	struct packet_timestamp pts;
+
 	if (!f_state || !p_info->pid_valid)
 		return;
 
@@ -630,8 +632,9 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 	 */
 	f_state->last_timestamp = p_info->time;
 
-	bpf_map_update_elem(&packet_ts, &p_info->pid, &p_info->time,
-			    BPF_NOEXIST);
+	pts.timestamp = p_info->time;
+	pts.rtt = f_state->srtt;
+	bpf_map_update_elem(&packet_ts, &p_info->pid, &pts, BPF_NOEXIST);
 }
 
 /*
@@ -642,16 +645,16 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 			       struct packet_info *p_info)
 {
 	struct rtt_event re = { 0 };
-	__u64 *p_ts;
+	struct packet_timestamp *pts;
 
 	if (!f_state || !p_info->reply_pid_valid)
 		return;
 
-	p_ts = bpf_map_lookup_elem(&packet_ts, &p_info->reply_pid);
-	if (!p_ts || p_info->time < *p_ts)
+	pts = bpf_map_lookup_elem(&packet_ts, &p_info->reply_pid);
+	if (!pts || p_info->time < pts->timestamp)
 		return;
 
-	re.rtt = p_info->time - *p_ts;
+	re.rtt = p_info->time - pts->timestamp;
 
 	// Delete timestamp entry as soon as RTT is calculated
 	debug_increment_autodel(DEBUG_PACKET_TIMESTAMP_MAP);
@@ -756,16 +759,21 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 {
 	struct packet_id key_copy;
 	struct packet_id *pid = ctx->key;
-	__u64 *timestamp = ctx->value;
+	struct packet_timestamp *pts = ctx->value;
 	__u64 now = bpf_ktime_get_ns();
 
 	debug_update_mapclean_stats(ctx->key, ctx->value, ctx->meta->seq_num,
 				    now, DEBUG_PACKET_TIMESTAMP_MAP);
 
-	if (!pid || !timestamp)
+	if (!pid || !pts)
+		return 0;
+	if (now <= pts->timestamp)
 		return 0;
 
-	if (now > *timestamp && now - *timestamp > TIMESTAMP_LIFETIME) {
+	if ((pts->rtt &&
+	     now - pts->timestamp > pts->rtt * TIMESTAMP_RTT_LIFETIME) ||
+	    now - pts->timestamp > TIMESTAMP_LIFETIME) {
+
 		debug_increment_timeoutdel(DEBUG_PACKET_TIMESTAMP_MAP);
 		__builtin_memcpy(&key_copy, pid, sizeof(key_copy));
 		bpf_map_delete_elem(&packet_ts, &key_copy);
@@ -782,20 +790,30 @@ int flowmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	struct flow_state *f_state = ctx->value;
 	struct flow_event fe;
 	__u64 now = bpf_ktime_get_ns();
+	__u64 age;
 
 	debug_update_mapclean_stats(ctx->key, ctx->value, ctx->meta->seq_num,
 				    now, DEBUG_FLOWSTATE_MAP);
 
 	if (!flow || !f_state)
 		return 0;
+	if (now < f_state->last_timestamp)
+		return 0;
 
-	if (now > f_state->last_timestamp &&
-	    now - f_state->last_timestamp > FLOW_LIFETIME) {
+	// Check if flow is too old for unopned/ICMP/other flow type
+	age = now - f_state->last_timestamp;
+	if ((!f_state->has_opened && age > UNOPENED_FLOW_LIFETIME) ||
+	    ((flow->proto == IPPROTO_ICMP || flow->proto == IPPROTO_ICMPV6) &&
+	     age > ICMP_FLOW_LIFETIME) ||
+	    age > FLOW_LIFETIME) {
 
+		// Delete flow
 		debug_increment_timeoutdel(DEBUG_FLOWSTATE_MAP);
 		__builtin_memcpy(&key_copy, flow, sizeof(key_copy));
-		if (f_state->has_opened &&
-		    bpf_map_delete_elem(&flow_state, &key_copy) == 0) {
+		if (bpf_map_delete_elem(&flow_state, &key_copy) == 0 &&
+		    f_state->has_opened) {
+
+			// Push closing event if flow was open
 			reverse_flow(&fe.flow, &key_copy);
 			fe.event_type = EVENT_TYPE_FLOW;
 			fe.timestamp = now;

@@ -15,8 +15,14 @@
 
 #define TIMESTAMP_LIFETIME                                                     \
 	(10 * NS_PER_SECOND) // Clear out packet timestamps if they're over 10 seconds
+#define TIMESTAMP_RTT_LIFETIME                                                 \
+	8 // If RTT is available, clear out packet timestamp if it's older than 8*RTT instead
 #define FLOW_LIFETIME                                                          \
 	(300 * NS_PER_SECOND) // Clear out flows if they're inactive over 300 seconds
+#define ICMP_FLOW_LIFETIME                                                     \
+	(30 * NS_PER_SECOND) // Clear out ICMP flows if they're inactive over 30 seconds
+#define UNOPENED_FLOW_LIFETIME                                                 \
+	(30 * NS_PER_SECOND) // Clear out flows that have not seen a response in over 30 seconds
 
 #define DEBUG_PACKET_TIMESTAMP_MAP 0
 #define DEBUG_FLOWSTATE_MAP 1
@@ -104,6 +110,15 @@ struct flow_state {
 struct packet_id {
 	struct network_tuple flow;
 	__u32 identifier; //tsval for TCP packets
+};
+
+/*
+ * Allow saving the current RTT together with the timestamp to allow RTT-based
+ * cleanup without having to perform an additional lookup in the flow map.
+ */
+struct packet_timestamp {
+	__u64 timestamp;
+	__u64 rtt;
 };
 
 /*

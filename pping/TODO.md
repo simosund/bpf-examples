@@ -35,11 +35,6 @@
     - Original pping checks if flow is bi-directional before adding
       timestamps, but this could miss shorter flows
 - [ ] Dynamically grow the maps if they are starting to get full
-- [ ] Improve map cleaning: Use a dynamic time to live for map entries
-      based on flow's RTT, instead of static 10s limit
-  - Keeping entries around for a long time allows the map to grow
-    unnecessarily large, which slows down the cleaning and may block
-    new entries
 - [ ] Use libxdp to load XDP program
 - [ ] Add support for other hooks
   - Ex TC-BFP on ingress instead of XDP?
@@ -63,3 +58,9 @@
     so that tools such as [ppviz](https://github.com/pollere/ppviz)
     works for both pping implementations.
 - [x] Add timestamps to output (as original pping)
+- [x] Improve map cleaning: Use a dynamic time to live for map entries
+      based on flow's RTT, instead of static 10s limit
+  - Keeping entries around for a long time allows the map to grow
+    unnecessarily large, which slows down the cleaning and may block
+    new entries
+
