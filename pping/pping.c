@@ -32,7 +32,7 @@ static const char *__doc__ =
 #define MON_TO_REAL_UPDATE_FREQ                                                \
 	(1 * NS_PER_SECOND) // Update offset between CLOCK_MONOTONIC and CLOCK_REALTIME once per second
 
-/* 
+/*
  * BPF implementation of pping using libbpf.
  * Uses TC-BPF for egress and XDP for ingress.
  * - On egrees, packets are parsed for an identifer,
@@ -50,6 +50,9 @@ struct map_cleanup_args {
 	struct bpf_link *tsclean_link;
 	struct bpf_link *flowclean_link;
 	__u64 cleanup_interval;
+#ifdef DEBUG
+	int debug_clean_stats_fd;
+#endif
 };
 
 // Store configuration values in struct to easily pass around
@@ -495,6 +498,23 @@ static __u64 get_time_ns(clockid_t clockid)
 	return (__u64)t.tv_sec * NS_PER_SECOND + (__u64)t.tv_nsec;
 }
 
+#ifdef DEBUG
+static void debug_report_clean_stats(int map_fd, __u32 index)
+{
+	struct stored_map_clean_stats stats;
+	if (bpf_map_lookup_elem(map_fd, &index, &stats) == 0) {
+		fprintf(stderr,
+			"%s: cycle: %u, entries: %u, time: %llu, timeout: %u, tot timeout: %llu, selfdel: %u, tot selfdel: %llu\n",
+			index == DEBUG_PACKET_TIMESTAMP_MAP ? "packet_ts" :
+								    "flow_state",
+			stats.clean_cycles, stats.last_processed_entries,
+			stats.last_runtime, stats.last_timeout_del,
+			stats.tot_timeout_del, stats.last_auto_del,
+			stats.tot_auto_del);
+	}
+}
+#endif
+
 static void *periodic_map_cleanup(void *args)
 {
 	struct map_cleanup_args *argp = args;
@@ -520,7 +540,10 @@ static void *periodic_map_cleanup(void *args)
 			fprintf(stderr, "Error while cleaning flow map: %s\n",
 				buf);
 		}
-
+#ifdef DEBUG
+		debug_report_clean_stats(argp->debug_clean_stats_fd, DEBUG_PACKET_TIMESTAMP_MAP);
+		debug_report_clean_stats(argp->debug_clean_stats_fd, DEBUG_FLOWSTATE_MAP);
+#endif
 		nanosleep(&interval, NULL);
 	}
 	pthread_exit(NULL);
@@ -881,6 +904,13 @@ static int setup_periodical_map_cleaning(struct bpf_object *obj,
 			get_libbpf_strerror(err));
 		return err;
 	}
+#ifdef DEBUG
+	clean_args.debug_clean_stats_fd =
+		bpf_object__find_map_fd_by_name(obj, "debug_clean_stats");
+	if (clean_args.debug_clean_stats_fd < 0)
+		fprintf(stderr, "Could not get fd for map debug_clean_stats: %s\n",
+			get_libbpf_strerror(clean_args.debug_clean_stats_fd));
+#endif
 
 	err = pthread_create(&tid, NULL, periodic_map_cleanup, &clean_args);
 	if (err) {

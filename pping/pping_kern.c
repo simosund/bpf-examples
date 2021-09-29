@@ -20,6 +20,7 @@
 
 #include <xdp/parsing_helpers.h>
 #include "pping.h"
+#include "pping_debug_cleanup.h"
 
 #define AF_INET 2
 #define AF_INET6 10
@@ -115,6 +116,7 @@ struct {
 	__uint(key_size, sizeof(__u32));
 	__uint(value_size, sizeof(__u32));
 } events SEC(".maps");
+
 
 // Help functions
 
@@ -479,6 +481,7 @@ static struct flow_state *update_flow(void *ctx, struct packet_info *p_info,
 		if (!f_state)
 			return NULL;
 
+		debug_increment_autodel(DEBUG_FLOWSTATE_MAP);
 		has_opened = f_state->has_opened;
 		if (bpf_map_delete_elem(&flow_state, &p_info->pid.flow) == 0 &&
 		    has_opened) {
@@ -519,6 +522,7 @@ static struct flow_state *update_rev_flow(void *ctx, struct packet_info *p_info,
 	// Close reverse flow
 	if (p_info->event_type == FLOW_EVENT_CLOSING_BOTH) {
 
+		debug_increment_autodel(DEBUG_FLOWSTATE_MAP);
 		has_opened = f_state->has_opened;
 		if (bpf_map_delete_elem(&flow_state, &p_info->reply_pid.flow) ==
 			    0 && has_opened) {
@@ -648,7 +652,9 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 		return;
 
 	re.rtt = p_info->time - *p_ts;
+
 	// Delete timestamp entry as soon as RTT is calculated
+	debug_increment_autodel(DEBUG_PACKET_TIMESTAMP_MAP);
 	bpf_map_delete_elem(&packet_ts, &p_info->reply_pid);
 
 	if (f_state->min_rtt == 0 || re.rtt < f_state->min_rtt)
@@ -753,10 +759,14 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	__u64 *timestamp = ctx->value;
 	__u64 now = bpf_ktime_get_ns();
 
+	debug_update_mapclean_stats(ctx->key, ctx->value, ctx->meta->seq_num,
+				    now, DEBUG_PACKET_TIMESTAMP_MAP);
+
 	if (!pid || !timestamp)
 		return 0;
 
 	if (now > *timestamp && now - *timestamp > TIMESTAMP_LIFETIME) {
+		debug_increment_timeoutdel(DEBUG_PACKET_TIMESTAMP_MAP);
 		__builtin_memcpy(&key_copy, pid, sizeof(key_copy));
 		bpf_map_delete_elem(&packet_ts, &key_copy);
 	}
@@ -773,11 +783,16 @@ int flowmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	struct flow_event fe;
 	__u64 now = bpf_ktime_get_ns();
 
+	debug_update_mapclean_stats(ctx->key, ctx->value, ctx->meta->seq_num,
+				    now, DEBUG_FLOWSTATE_MAP);
+
 	if (!flow || !f_state)
 		return 0;
 
 	if (now > f_state->last_timestamp &&
 	    now - f_state->last_timestamp > FLOW_LIFETIME) {
+
+		debug_increment_timeoutdel(DEBUG_FLOWSTATE_MAP);
 		__builtin_memcpy(&key_copy, flow, sizeof(key_copy));
 		if (f_state->has_opened &&
 		    bpf_map_delete_elem(&flow_state, &key_copy) == 0) {

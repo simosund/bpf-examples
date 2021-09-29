@@ -18,6 +18,9 @@
 #define FLOW_LIFETIME                                                          \
 	(300 * NS_PER_SECOND) // Clear out flows if they're inactive over 300 seconds
 
+#define DEBUG_PACKET_TIMESTAMP_MAP 0
+#define DEBUG_FLOWSTATE_MAP 1
+
 typedef __u64 fixpoint64;
 #define FIXPOINT_SHIFT 16
 #define DOUBLE_TO_FIXPOINT(X) ((fixpoint64)((X) * (1UL << FIXPOINT_SHIFT)))
@@ -152,5 +155,24 @@ union pping_event {
 	struct rtt_event rtt_event;
 	struct flow_event flow_event;
 };
+
+/*
+ * Struct for storing various debug-information about the map cleaning process.
+ * Needs to be here instead of pping_debug_cleanup.h as userspace side needs
+ * access to it as well.
+ */
+#ifdef DEBUG
+struct stored_map_clean_stats {
+	__u64 tot_runtime;
+	__u64 tot_processed_entries;
+	__u64 tot_timeout_del;
+	__u64 tot_auto_del;
+	__u64 last_runtime;
+	__u32 last_processed_entries;
+	__u32 last_timeout_del;
+	__u32 last_auto_del;
+	__u32 clean_cycles;
+};
+#endif
 
 #endif
