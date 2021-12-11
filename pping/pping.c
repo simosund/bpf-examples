@@ -6,6 +6,7 @@ static const char *__doc__ =
 #include <bpf/libbpf.h>
 #include <linux/if_link.h>
 #include <linux/err.h>
+#include <linux/perf_event.h>
 #include <net/if.h> // For if_nametoindex
 #include <arpa/inet.h> // For inet_ntoa and ntohs
 
@@ -79,6 +80,21 @@ struct pping_config {
 	bool force;
 	bool created_tc_hook;
 };
+
+/*Perf event types, copied from libbpf.c*/
+struct perf_sample_raw {
+	struct perf_event_header header;
+	uint32_t size;
+	char data[];
+};
+
+struct perf_sample_lost {
+	struct perf_event_header header;
+	uint64_t id;
+	uint64_t lost;
+	uint64_t sample_id;
+};
+
 
 static volatile int keep_running = 1;
 static json_writer_t *json_ctx = NULL;
@@ -923,6 +939,57 @@ static int setup_periodical_map_cleaning(struct bpf_object *obj,
 	return 0;
 }
 
+/* Based on libbpf.c/perf_buffer__process_record*/
+static enum bpf_perf_event_ret
+process_perf_event(void *ctx, int cpu, struct perf_event_header *event)
+{
+	void *data = event;
+	struct perf_sample_raw *s = data;
+	struct perf_sample_lost *l = data;
+
+	switch (event->type) {
+	case PERF_RECORD_SAMPLE:
+		print_event_func(ctx, cpu, s->data, s->size);
+		break;
+	case PERF_RECORD_LOST:
+		handle_missed_rtt_event(ctx, cpu, l->lost);
+		break;
+	default:
+		fprintf(stderr, "Unknown perf sample type %d\n", event->type);
+		return LIBBPF_PERF_EVENT_ERROR;
+	}
+
+	return LIBBPF_PERF_EVENT_CONT;
+}
+
+static struct perf_buffer *setup_perf_buffer(struct bpf_object *obj,
+					     const char *name, int page_cnt,
+					     int wakeup_events)
+{
+	struct perf_event_attr attr = {
+		.sample_type = PERF_SAMPLE_RAW,
+		.type = PERF_TYPE_SOFTWARE,
+		.config = PERF_COUNT_SW_BPF_OUTPUT,
+		//.sample_period = 1,
+		.wakeup_events = wakeup_events, /* get an fd notification for X events */
+		// Much faster to not wakeup every packet, but need to flush/collect before exit
+		//		.wakeup_events	= 64,/* get an fd notification for X events */
+	};
+
+	struct perf_buffer_raw_opts opts = {
+		.attr = &attr,
+		//.cpu_cnt = 0,
+		.event_cb = process_perf_event,
+		//.ctx = NULL
+	};
+
+	int map_fd = bpf_object__find_map_fd_by_name(obj, name);
+	if (map_fd < 0)
+		return ERR_PTR(map_fd);
+
+	return perf_buffer__new_raw(map_fd, page_cnt, &opts);
+}
+
 int main(int argc, char *argv[])
 {
 	int err = 0, detach_err;
@@ -994,6 +1061,18 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
+	// Set up perf buffer
+	/* pb = perf_buffer__new(bpf_object__find_map_fd_by_name(obj, */
+	/* 						      config.event_map), */
+	/* 		      PERF_BUFFER_PAGES, &pb_opts); */
+	pb = setup_perf_buffer(obj, config.event_map, PERF_BUFFER_PAGES, 64);
+	err = libbpf_get_error(pb);
+	if (err) {
+		fprintf(stderr, "Failed to open perf buffer %s: %s\n",
+			config.event_map, get_libbpf_strerror(err));
+		goto cleanup_attached_progs;
+	}
+
 	err = setup_periodical_map_cleaning(obj, &config);
 	if (err) {
 		fprintf(stderr, "Failed setting up map cleaning: %s\n",
@@ -1001,16 +1080,6 @@ int main(int argc, char *argv[])
 		goto cleanup_attached_progs;
 	}
 
-	// Set up perf buffer
-	pb = perf_buffer__new(bpf_object__find_map_fd_by_name(obj,
-							      config.event_map),
-			      PERF_BUFFER_PAGES, &pb_opts);
-	err = libbpf_get_error(pb);
-	if (err) {
-		fprintf(stderr, "Failed to open perf buffer %s: %s\n",
-			config.event_map, get_libbpf_strerror(err));
-		goto cleanup_attached_progs;
-	}
 
 	// Allow program to perform cleanup on Ctrl-C
 	signal(SIGINT, abort_program);
