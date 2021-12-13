@@ -101,7 +101,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct packet_id);
 	__type(value, struct packet_timestamp);
-	__uint(max_entries, 16384);
+	__uint(max_entries, 65536);
 } packet_ts SEC(".maps");
 
 struct {
