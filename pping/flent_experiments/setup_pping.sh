@@ -3,7 +3,7 @@
 KPPING_PATH="~/pping"
 EPPING_PATH="~/bpf-examples/pping"
 
-EPPING_EXTRA_ARGS="-f -r0 -I tc"
+EPPING_EXTRA_ARGS="-f -r 0 -I xdp"
 KPPING_EXTRA_ARGS=""
 
 pping_version=${1:-"e_pping"}
