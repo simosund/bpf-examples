@@ -24,6 +24,9 @@ static const char *__doc__ =
 #include "json_writer.h"
 #include "pping.h" //common structs for user-space and BPF parts
 
+// Maximum string length for IPv6 prefix (including /xxx and '\0')
+#define INET6_PREFIXSTRLEN (INET6_ADDRSTRLEN + 4)
+
 #define PERF_BUFFER_PAGES 64 // Related to the perf-buffer size?
 #define PERF_POLL_TIMEOUT_MS 100
 
@@ -66,12 +69,24 @@ struct map_cleanup_args {
 	bool valid_thread;
 };
 
+
+// Structure to contain arguments for periodic_rtt_aggregation (for passing
+// to pthread_create). Also keeps info on thread in which aggregation runs.
+struct aggregation_args {
+	pthread_t tid;
+	__u64 aggregation_interval;
+	int map_fd;
+	int err;
+	bool valid_thread;
+};
+
 // Store configuration values in struct to easily pass around
 struct pping_config {
 	struct bpf_config bpf_config;
 	struct bpf_tc_opts tc_ingress_opts;
 	struct bpf_tc_opts tc_egress_opts;
 	struct map_cleanup_args clean_args;
+	struct aggregation_args agg_args;
 	char *object_path;
 	char *ingress_prog;
 	char *egress_prog;
@@ -80,6 +95,7 @@ struct pping_config {
 	char *packet_map;
 	char *flow_map;
 	char *event_map;
+	char *agg_map;
 	int ifindex;
 	struct xdp_program *xdp_prog;
 	int ingress_prog_id;
@@ -89,6 +105,7 @@ struct pping_config {
 	enum xdp_attach_mode xdp_mode;
 	bool force;
 	bool created_tc_hook;
+	bool add_catchall_prefix;
 };
 
 static volatile sig_atomic_t keep_running = 1;
@@ -110,6 +127,7 @@ static const struct option long_options[] = {
 	{ "icmp",             no_argument,       NULL, 'C' }, // Calculate and report RTTs for ICMP echo-reply traffic
 	{ "include-local",    no_argument,       NULL, 'l' }, // Also report "internal" RTTs
 	{ "include-SYN",      no_argument,       NULL, 's' }, // Include SYN-packets in tracking (may fill up flow state with half-open connections)
+	{ "aggregate",        required_argument, NULL, 'a' }, // Aggregate RTTs every X seconds instead of reporting them individually
 	{ 0, 0, NULL, 0 }
 };
 
@@ -171,16 +189,19 @@ static int parse_bounded_double(double *res, const char *str, double low,
 static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 {
 	int err, opt;
-	double rate_limit_ms, cleanup_interval_s, rtt_rate;
+	double rate_limit_ms, cleanup_interval_s, rtt_rate, agg_interval;
 
 	config->ifindex = 0;
 	config->bpf_config.localfilt = true;
 	config->force = false;
+	config->add_catchall_prefix = false;
 	config->bpf_config.track_tcp = false;
 	config->bpf_config.track_icmp = false;
 	config->bpf_config.skip_syn = true;
+	config->bpf_config.push_individual_events = true;
+	config->bpf_config.agg_rtts = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:",
+	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -290,6 +311,37 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 					"xdp-mode must be 'unspecified', 'native' or 'generic'\n");
 				return -EINVAL;
 			}
+			break;
+		case 'a':
+			/* Aggregated output currently disables individual RTT
+			 * reports, as using both may cause the output to
+			 * interleave in strange fashion as neither the
+			 * individual reports nor aggregated reports write the
+			 * entire entry as an atmoic operation (meaning that
+			 * parts of individual reports may be interleaved with
+			 * parts of an aggregated report).
+			 *
+			 * If deemed necessary it would be possible to support
+			 * both individual and aggregated reports simultaniously
+			 * in the future. The BPF side can already both push and
+			 * aggregate RTTs at the same time, and the userside
+			 * uses different threads to concurrently poll the
+			 * individual events and periodically lookup the
+			 * aggregation map. It's simply a matter of fixing
+			 * so that both threads can write to the same stream
+			 * concurrently without causing issues. */
+
+			config->bpf_config.push_individual_events = false;
+			config->bpf_config.agg_rtts = true;
+
+			err = parse_bounded_double(&agg_interval, optarg, 0,
+						   7 * S_PER_DAY, "aggregate");
+			if (err)
+				return -EINVAL;
+
+			config->agg_args.aggregation_interval =
+				agg_interval * NS_PER_SECOND;
+			config->add_catchall_prefix = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -618,18 +670,60 @@ static __u64 convert_monotonic_to_realtime(__u64 monotonic_time)
 }
 
 /*
+ * Is the passed ip an IPv4 address mapped into the IPv6 space as specified by
+ * RFC 4291 sec 2.5.5.2?
+ */
+static bool is_ipv4_in_ipv6(const struct in6_addr *ip)
+{
+	__u16 ipv4_prefix[] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0xFFFF };
+
+	return memcmp(ipv4_prefix, ip, sizeof(ipv4_prefix)) == 0;
+}
+
+/*
  * Wrapper around inet_ntop designed to handle the "bug" that mapped IPv4
  * addresses are formated as IPv6 addresses for AF_INET6
  */
 static int format_ip_address(char *buf, size_t size, int af,
 			     const struct in6_addr *addr)
 {
+	if (af == AF_UNSPEC)
+		af = is_ipv4_in_ipv6(addr) ? AF_INET : AF_INET6;
+
 	if (af == AF_INET)
 		return inet_ntop(af, &addr->s6_addr[12], buf, size) ? -errno :
-									    0;
+								      0;
 	else if (af == AF_INET6)
 		return inet_ntop(af, addr, buf, size) ? -errno : 0;
 	return -EINVAL;
+}
+
+static int format_ipprefix(char *buf, size_t size,
+			   struct lpm_trie_key *ip_prefix)
+{
+	__u32 prefixlen = ip_prefix->prefixlen;
+	size_t iplen;
+	int err;
+
+	if (size < INET6_PREFIXSTRLEN)
+		return -ENOSPC;
+	if (prefixlen > 128)
+		return -EINVAL;
+
+	format_ip_address(buf, size, prefixlen >= 96 ? AF_UNSPEC : AF_INET6,
+			  &ip_prefix->ip);
+
+	if (is_ipv4_in_ipv6(&ip_prefix->ip) && prefixlen >= 96)
+		prefixlen -= 96;
+
+	iplen = strlen(buf);
+	err = snprintf(buf + iplen, size - iplen, "/%u", prefixlen);
+	if (err > size - iplen)
+		err = -ENOSPC;
+	else if (err > 0)
+		err = 0;
+
+	return err;
 }
 
 static const char *proto_to_str(__u16 proto)
@@ -869,6 +963,91 @@ static void handle_missed_events(void *ctx, int cpu, __u64 lost_cnt)
 	fprintf(stderr, "Lost %llu events on CPU %d\n", lost_cnt, cpu);
 }
 
+static void print_histogram(FILE *stream,
+			    struct aggregated_rtt_stats *rtt_stats)
+{
+	int i;
+
+	fprintf(stream, "[%llu", rtt_stats->bins[0]);
+	for (i = 1; i < RTT_AGG_NR_BINS; i++)
+		fprintf(stream, ",%llu", rtt_stats->bins[i]);
+	fprintf(stream, "]");
+}
+
+static void print_aggregated_rtts(FILE *stream, __u64 t,
+				  struct lpm_trie_key *ip_prefix,
+				  struct aggregated_rtt_stats *rtt_stats)
+{
+	char prefixstr[INET6_PREFIXSTRLEN] = "";
+	format_ipprefix(prefixstr, sizeof(prefixstr), ip_prefix);
+
+	print_ns_datetime(stream, t);
+	fprintf(stream,
+		": %s -> min=%llu.%06llu ms, max=%llu.%06llu ms, histogram=",
+		prefixstr, rtt_stats->min / NS_PER_MS,
+		rtt_stats->min % NS_PER_MS, rtt_stats->max / NS_PER_MS,
+		rtt_stats->max % NS_PER_MS);
+	print_histogram(stream, rtt_stats);
+	fprintf(stream, "\n");
+}
+
+static int report_aggregated_rtts(int map_fd)
+{
+	struct aggregated_rtt_stats rtt_stats;
+
+	/* First prev_key needs to be invalid so that bpf_map_get_next_key
+	 * returns the first real key. */
+	struct lpm_trie_key prev_key = { .prefixlen = 999 };
+	struct lpm_trie_key key;
+	int err;
+	__u64 t = get_time_ns(CLOCK_MONOTONIC);
+
+	while ((err = bpf_map_get_next_key(map_fd, &prev_key, &key)) == 0) {
+		err = bpf_map_lookup_elem(map_fd, &key, &rtt_stats);
+		if (err)
+			return err;
+
+		// Only print prefixes with have RTT samples
+		if (rtt_stats.max > 0)
+			print_aggregated_rtts(stdout, t, &key, &rtt_stats);
+
+		prev_key = key;
+	}
+	if (err == -ENOENT) // Reached end of map
+		err = 0;
+
+	return err;
+}
+
+static void *periodic_rtt_aggregation(void *args)
+{
+	struct aggregation_args *argp = args;
+	char buf[256];
+	int err;
+
+	struct timespec interval = {
+		.tv_sec = argp->aggregation_interval / NS_PER_SECOND,
+		.tv_nsec = argp->aggregation_interval % NS_PER_SECOND,
+	};
+
+	argp->err = 0;
+	while (keep_running) {
+		err = report_aggregated_rtts(argp->map_fd);
+		if (err) {
+			libbpf_strerror(err, buf, sizeof(buf));
+			fprintf(stderr, "Failed fetching aggregated RTTs: %s\n",
+				buf);
+			fprintf(stderr, "Aborting program\n");
+			abort_program(SIGUSR1);
+			break;
+		}
+
+		nanosleep(&interval, NULL);
+	}
+
+	pthread_exit(&argp->err);
+}
+
 /*
  * Sets only the necessary programs in the object file to autoload.
  *
@@ -889,6 +1068,39 @@ static int set_programs_to_load(struct bpf_object *obj,
 		return libbpf_get_error(prog);
 
 	return bpf_program__set_autoload(prog, false);
+}
+
+static int add_aggregation_prefix(int map_fd, struct lpm_trie_key *ip_prefix)
+{
+	struct aggregated_rtt_stats empty_stats = { 0 };
+
+	return bpf_map_update_elem(map_fd, ip_prefix, &empty_stats,
+				   BPF_NOEXIST);
+}
+
+static int add_aggregation_prefixes(struct bpf_object *obj,
+				    struct pping_config *config)
+{
+	int agg_map_fd, err;
+	struct lpm_trie_key ip_prefix;
+
+	if (!config->bpf_config.agg_rtts)
+		return 0;
+
+	agg_map_fd = bpf_object__find_map_fd_by_name(obj, config->agg_map);
+	if (agg_map_fd < 0)
+		return agg_map_fd;
+
+	if (config->add_catchall_prefix) {
+		memset(&ip_prefix, 0, sizeof(ip_prefix));
+		err = add_aggregation_prefix(agg_map_fd, &ip_prefix);
+		if (err)
+			return err;
+	}
+
+	/* TODO - Add additional user-provided IP-prefixes */
+
+	return 0;
 }
 
 static int load_attach_bpfprogs(struct bpf_object **obj,
@@ -947,6 +1159,20 @@ static int load_attach_bpfprogs(struct bpf_object **obj,
 		fprintf(stderr,
 			"Failed attaching ingress BPF program on interface %s: %s\n",
 			config->ifname, get_libbpf_strerror(err));
+		goto ingress_err;
+	}
+
+	/* Would be best to set up the prefixes for the aggregation map before
+	 * attaching any of the BPF programs, but maps only exist after BPF
+	 * programs are loaded. Since libxdp loads the programs itself, we
+	 * cannot separate the load and attach stages in a convenient way.
+	 * Instead simply set up the prefixes before the egress part is also
+	 * attached (before we should be able to get any actual RTTs). */
+	err = add_aggregation_prefixes(*obj, config);
+	if (err) {
+		fprintf(stderr,
+			"Failed setting up IP-prefixes for aggregation: %s\n",
+			get_libbpf_strerror(err));
 		goto ingress_err;
 	}
 
@@ -1039,6 +1265,38 @@ destroy_ts_link:
 	return err;
 }
 
+int setup_periodical_aggregate_rtts(struct bpf_object *obj,
+				    struct pping_config *config)
+{
+	int err = 0, fd;
+
+	if (config->agg_args.valid_thread) {
+		fprintf(stderr,
+			"There already exists a thread for RTT aggregation\n");
+		return -EINVAL;
+	}
+
+	fd = bpf_object__find_map_fd_by_name(obj, config->agg_map);
+	if (fd < 0) {
+		fprintf(stderr, "Unable to find aggregation map %s: %s\n",
+			config->agg_map, get_libbpf_strerror(fd));
+		return fd;
+	}
+	config->agg_args.map_fd = fd;
+
+	err = pthread_create(&config->agg_args.tid, NULL,
+			     periodic_rtt_aggregation, &config->agg_args);
+	if (err) {
+		fprintf(stderr,
+			"Failed starting thread to periodically aggregate RTTs: %s\n",
+			get_libbpf_strerror(err));
+		return err;
+	}
+
+	config->agg_args.valid_thread = true;
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	int err = 0, detach_err;
@@ -1055,6 +1313,8 @@ int main(int argc, char *argv[])
 				.use_srtt = false },
 		.clean_args = { .cleanup_interval = 1 * NS_PER_SECOND,
 				.valid_thread = false },
+		.agg_args = { .aggregation_interval = 1 * NS_PER_SECOND,
+			      .valid_thread = false },
 		.object_path = "pping_kern.o",
 		.ingress_prog = PROG_INGRESS_TC,
 		.egress_prog = PROG_EGRESS_TC,
@@ -1063,6 +1323,7 @@ int main(int argc, char *argv[])
 		.packet_map = "packet_ts",
 		.flow_map = "flow_state",
 		.event_map = "events",
+		.agg_map = "agg_map",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
 		.xdp_mode = XDP_MODE_NATIVE,
@@ -1115,6 +1376,13 @@ int main(int argc, char *argv[])
 		output_format_to_str(config.output_format),
 		tracked_protocols_to_str(&config), config.ifname);
 
+	if (config.bpf_config.agg_rtts)
+		fprintf(stderr,
+			"Aggregating RTTs in histograms with %lu %lu.%09lu ms wide bins\n",
+			RTT_AGG_NR_BINS, RTT_AGG_BIN_WIDTH / NS_PER_MS,
+			RTT_AGG_BIN_WIDTH % NS_PER_MS);
+	
+
 	// Allow program to perform cleanup on Ctrl-C
 	signal(SIGINT, abort_program);
 	signal(SIGTERM, abort_program);
@@ -1146,6 +1414,16 @@ int main(int argc, char *argv[])
 		goto cleanup_perf_buffer;
 	}
 
+	if (config.bpf_config.agg_rtts) {
+		err = setup_periodical_aggregate_rtts(obj, &config);
+		if (err) {
+			fprintf(stderr,
+				"Failed setting up periodical aggregation: %s\n",
+				get_libbpf_strerror(err));
+			goto cleanup_periodical_cleaning;
+		}
+	}
+
 	// Main loop
 	while (keep_running) {
 		if ((err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS)) < 0) {
@@ -1163,6 +1441,14 @@ int main(int argc, char *argv[])
 		jsonw_destroy(&json_ctx);
 	}
 
+	if (config.agg_args.valid_thread) {
+		pthread_cancel(config.agg_args.tid);
+		pthread_join(config.agg_args.tid, &thread_err);
+		if (thread_err != PTHREAD_CANCELED)
+			err = err ? err : config.agg_args.err;
+	}
+
+cleanup_periodical_cleaning:
 	if (config.clean_args.valid_thread) {
 		pthread_cancel(config.clean_args.tid);
 		pthread_join(config.clean_args.tid, &thread_err);

@@ -22,6 +22,9 @@ typedef __u64 fixpoint64;
 #define EVENT_TYPE_MAP_FULL 3
 #define EVENT_TYPE_MAP_CLEAN 4
 
+#define RTT_AGG_NR_BINS 1000UL
+#define RTT_AGG_BIN_WIDTH (1 * NS_PER_MS) // 1 ms
+
 enum __attribute__((__packed__)) flow_event_type {
 	FLOW_EVENT_NONE,
 	FLOW_EVENT_OPENING,
@@ -65,7 +68,20 @@ struct bpf_config {
 	bool track_icmp;
 	bool localfilt;
 	bool skip_syn;
-	__u8 reserved[3];
+	bool push_individual_events;
+	bool agg_rtts;
+	__u8 reserved;
+};
+
+/*
+ * Used for key in BPF_MAP_TYPE_LPM_TRIE.
+ * This is technically the version for IPv6 addresses, but can also be used for
+ * IPv4 by simply mapping IPv4 addresses into the IPv6 address space (where the
+ * IPv4 address is stored in the last 32 bits).
+ */
+struct lpm_trie_key {
+	__u32 prefixlen;
+	struct in6_addr ip;
 };
 
 /*
@@ -208,6 +224,12 @@ union pping_event {
 	struct flow_event flow_event;
 	struct map_full_event map_event;
 	struct map_clean_event map_clean_event;
+};
+
+struct aggregated_rtt_stats {
+	__u64 min;
+	__u64 max;
+	__u64 bins[RTT_AGG_NR_BINS];
 };
 
 #endif
