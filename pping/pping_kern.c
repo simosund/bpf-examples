@@ -153,7 +153,22 @@ struct {
 	__type(value, struct aggregated_rtt_stats);
 	__uint(max_entries, 16384);
 	__uint(map_flags, BPF_F_NO_PREALLOC); // Apparently required for LPM maps
-} agg_map SEC(".maps");
+} agg_map1 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct lpm_trie_key);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} agg_map2 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 1);
+} active_agg_map SEC(".maps");
 
 // Help functions
 
@@ -926,7 +941,6 @@ static bool is_local_address(struct packet_info *p_info, void *ctx)
 	       ret == BPF_FIB_LKUP_RET_FWD_DISABLED;
 }
 
-
 static bool is_new_identifier(struct packet_id *pid, struct flow_state *f_state)
 {
 	if (pid->flow.proto == IPPROTO_TCP)
@@ -940,16 +954,30 @@ static bool is_new_identifier(struct packet_id *pid, struct flow_state *f_state)
 	return pid->identifier != f_state->last_id;
 }
 
+static struct aggregated_rtt_stats *lookup_active_agg_map(struct in6_addr *ip)
+{
+	struct lpm_trie_key key = { .ip = *ip, .prefixlen = 128 };
+	__u32 *map_choice;
+	__u32 zero = 0;
+	void *agg_map;
+
+	map_choice = bpf_map_lookup_elem(&active_agg_map, &zero);
+	if (!map_choice)
+		return NULL;
+	agg_map = *map_choice == 0 ? (void *)&agg_map1 : (void *)&agg_map2;
+
+	return bpf_map_lookup_elem(agg_map, &key);
+}
+
 static void aggregate_rtt(__u64 rtt, struct in6_addr *ip)
 {
+	struct aggregated_rtt_stats *rtt_agg;
+	__u32 bin_idx;
+
 	if (!config.agg_rtts)
 		return;
 
-	struct aggregated_rtt_stats *rtt_agg;
-	struct lpm_trie_key key = { .prefixlen = 128, .ip = *ip };
-	int bin_idx;
-
-	rtt_agg = bpf_map_lookup_elem(&agg_map, &key);
+	rtt_agg = lookup_active_agg_map(ip);
 	if (!rtt_agg)
 		return;
 
