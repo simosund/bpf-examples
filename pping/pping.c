@@ -75,7 +75,9 @@ struct map_cleanup_args {
 struct aggregation_args {
 	pthread_t tid;
 	__u64 aggregation_interval;
-	int map_fd;
+	int map_fd1;
+	int map_fd2;
+	int map_active_fd;
 	int err;
 	bool valid_thread;
 };
@@ -95,7 +97,9 @@ struct pping_config {
 	char *packet_map;
 	char *flow_map;
 	char *event_map;
-	char *agg_map;
+	char *agg_map1;
+	char *agg_map2;
+	char *agg_map_active;
 	int ifindex;
 	struct xdp_program *xdp_prog;
 	int ingress_prog_id;
@@ -968,9 +972,9 @@ static void print_histogram(FILE *stream,
 {
 	int i;
 
-	fprintf(stream, "[%llu", rtt_stats->bins[0]);
+	fprintf(stream, "[%u", rtt_stats->bins[0]);
 	for (i = 1; i < RTT_AGG_NR_BINS; i++)
-		fprintf(stream, ",%llu", rtt_stats->bins[i]);
+		fprintf(stream, ",%u", rtt_stats->bins[i]);
 	fprintf(stream, "]");
 }
 
@@ -991,25 +995,59 @@ static void print_aggregated_rtts(FILE *stream, __u64 t,
 	fprintf(stream, "\n");
 }
 
-static int report_aggregated_rtts(int map_fd)
+/* Changes which map the BPF progs use to aggregate the RTTs in.
+ * On success returns the map idx that the BPF progs used BEFORE the switch
+ * (and thus the map filled with data up until the switch, but no longer
+ * beeing activly used by the BPF progs).
+ * On failure returns a negative error code */
+static int switch_agg_map(int map_fd1, int map_fd2, int map_active_fd)
 {
-	struct aggregated_rtt_stats rtt_stats;
+	__u32 prev_map, next_map, key = 0;
+	int err;
+
+	// Get current map being used by BPF progs
+	err = bpf_map_lookup_elem(map_active_fd, &key, &prev_map);
+	if (err)
+		return err;
+
+	// Swap map being used by BPF progs to agg RTTs in
+	next_map = prev_map == 1 ? 0 : 1;
+	err = bpf_map_update_elem(map_active_fd, &key, &next_map, BPF_EXIST);
+	if (err)
+		return err;
+
+	return prev_map == 0 ? map_fd1 : map_fd2;
+}
+
+static int report_aggregated_rtts(int map_active_fd, int map_fd1, int map_fd2)
+{
+	struct aggregated_rtt_stats rtt_stats, empty_stats = { 0 };
 
 	/* First prev_key needs to be invalid so that bpf_map_get_next_key
 	 * returns the first real key. */
 	struct lpm_trie_key prev_key = { .prefixlen = 999 };
 	struct lpm_trie_key key;
-	int err;
+	int agg_map, err;
 	__u64 t = get_time_ns(CLOCK_MONOTONIC);
 
-	while ((err = bpf_map_get_next_key(map_fd, &prev_key, &key)) == 0) {
-		err = bpf_map_lookup_elem(map_fd, &key, &rtt_stats);
+	agg_map = switch_agg_map(map_fd1, map_fd2, map_active_fd);
+	if (agg_map < 0)
+		return agg_map;
+
+	while ((err = bpf_map_get_next_key(agg_map, &prev_key, &key)) == 0) {
+		err = bpf_map_lookup_elem(agg_map, &key, &rtt_stats);
 		if (err)
 			return err;
 
-		// Only print prefixes with have RTT samples
-		if (rtt_stats.max > 0)
+		// Only print and reset prefixes which have RTT samples
+		if (rtt_stats.max > 0) {
 			print_aggregated_rtts(stdout, t, &key, &rtt_stats);
+
+			err = bpf_map_update_elem(agg_map, &key, &empty_stats,
+						  BPF_EXIST);
+			if (err)
+				return err;
+		}
 
 		prev_key = key;
 	}
@@ -1032,7 +1070,8 @@ static void *periodic_rtt_aggregation(void *args)
 
 	argp->err = 0;
 	while (keep_running) {
-		err = report_aggregated_rtts(argp->map_fd);
+		err = report_aggregated_rtts(argp->map_active_fd, argp->map_fd1,
+					     argp->map_fd2);
 		if (err) {
 			libbpf_strerror(err, buf, sizeof(buf));
 			fprintf(stderr, "Failed fetching aggregated RTTs: %s\n",
@@ -1079,7 +1118,8 @@ static int add_aggregation_prefix(int map_fd, struct lpm_trie_key *ip_prefix)
 }
 
 static int add_aggregation_prefixes(struct bpf_object *obj,
-				    struct pping_config *config)
+				    struct pping_config *config,
+				    const char *map_name)
 {
 	int agg_map_fd, err;
 	struct lpm_trie_key ip_prefix;
@@ -1087,7 +1127,7 @@ static int add_aggregation_prefixes(struct bpf_object *obj,
 	if (!config->bpf_config.agg_rtts)
 		return 0;
 
-	agg_map_fd = bpf_object__find_map_fd_by_name(obj, config->agg_map);
+	agg_map_fd = bpf_object__find_map_fd_by_name(obj, map_name);
 	if (agg_map_fd < 0)
 		return agg_map_fd;
 
@@ -1168,7 +1208,9 @@ static int load_attach_bpfprogs(struct bpf_object **obj,
 	 * cannot separate the load and attach stages in a convenient way.
 	 * Instead simply set up the prefixes before the egress part is also
 	 * attached (before we should be able to get any actual RTTs). */
-	err = add_aggregation_prefixes(*obj, config);
+	err = add_aggregation_prefixes(*obj, config, config->agg_map1);
+	if (!err)
+		err = add_aggregation_prefixes(*obj, config, config->agg_map2);
 	if (err) {
 		fprintf(stderr,
 			"Failed setting up IP-prefixes for aggregation: %s\n",
@@ -1276,13 +1318,29 @@ int setup_periodical_aggregate_rtts(struct bpf_object *obj,
 		return -EINVAL;
 	}
 
-	fd = bpf_object__find_map_fd_by_name(obj, config->agg_map);
+	fd = bpf_object__find_map_fd_by_name(obj, config->agg_map1);
 	if (fd < 0) {
 		fprintf(stderr, "Unable to find aggregation map %s: %s\n",
-			config->agg_map, get_libbpf_strerror(fd));
+			config->agg_map1, get_libbpf_strerror(fd));
 		return fd;
 	}
-	config->agg_args.map_fd = fd;
+	config->agg_args.map_fd1 = fd;
+
+	fd = bpf_object__find_map_fd_by_name(obj, config->agg_map2);
+	if (fd < 0) {
+		fprintf(stderr, "Unable to find aggregation map %s: %s\n",
+			config->agg_map2, get_libbpf_strerror(fd));
+		return fd;
+	}
+	config->agg_args.map_fd2 = fd;
+
+	fd = bpf_object__find_map_fd_by_name(obj, config->agg_map_active);
+	if (fd < 0) {
+		fprintf(stderr, "Unable to find aggregation idx map %s: %s\n",
+			config->agg_map_active, get_libbpf_strerror(fd));
+		return fd;
+	}
+	config->agg_args.map_active_fd = fd;
 
 	err = pthread_create(&config->agg_args.tid, NULL,
 			     periodic_rtt_aggregation, &config->agg_args);
@@ -1323,7 +1381,9 @@ int main(int argc, char *argv[])
 		.packet_map = "packet_ts",
 		.flow_map = "flow_state",
 		.event_map = "events",
-		.agg_map = "agg_map",
+		.agg_map1 = "agg_map1",
+		.agg_map2 = "agg_map2",
+		.agg_map_active = "active_agg_map",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
 		.xdp_mode = XDP_MODE_NATIVE,
