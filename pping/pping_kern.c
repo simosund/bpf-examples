@@ -988,7 +988,7 @@ static void aggregate_rtt(__u64 rtt, struct in6_addr *ip)
 
 	bin_idx = rtt / RTT_AGG_BIN_WIDTH;
 	bin_idx = bin_idx >= RTT_AGG_NR_BINS ? RTT_AGG_NR_BINS - 1 : bin_idx;
-	rtt_agg->bins[bin_idx]++;
+	__sync_fetch_and_add(&rtt_agg->bins[bin_idx], 1);
 }
 
 /*
