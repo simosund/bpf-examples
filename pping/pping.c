@@ -105,6 +105,7 @@ struct pping_config {
 	int ingress_prog_id;
 	int egress_prog_id;
 	char ifname[IF_NAMESIZE];
+	char prefix_file[MAX_PATH_LEN];
 	enum PPING_OUTPUT_FORMAT output_format;
 	enum xdp_attach_mode xdp_mode;
 	bool force;
@@ -132,6 +133,7 @@ static const struct option long_options[] = {
 	{ "include-local",    no_argument,       NULL, 'l' }, // Also report "internal" RTTs
 	{ "include-SYN",      no_argument,       NULL, 's' }, // Include SYN-packets in tracking (may fill up flow state with half-open connections)
 	{ "aggregate",        required_argument, NULL, 'a' }, // Aggregate RTTs every X seconds instead of reporting them individually
+	{ "prefix-file",      required_argument, NULL, 'p' }, // Path of file containing IP prefixes to aggregate RTTs for
 	{ 0, 0, NULL, 0 }
 };
 
@@ -199,13 +201,14 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.localfilt = true;
 	config->force = false;
 	config->add_catchall_prefix = false;
+	config->prefix_file[0] = '\0';
 	config->bpf_config.track_tcp = false;
 	config->bpf_config.track_icmp = false;
 	config->bpf_config.skip_syn = true;
 	config->bpf_config.push_individual_events = true;
 	config->bpf_config.agg_rtts = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:",
+	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:p:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -345,7 +348,14 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 
 			config->agg_args.aggregation_interval =
 				agg_interval * NS_PER_SECOND;
-			config->add_catchall_prefix = true;
+			break;
+		case 'p':
+			if (strlen(optarg) > MAX_PATH_LEN) {
+				fprintf(stderr, "prefix-file path too long (> %d)\n", MAX_PATH_LEN);
+				return -EINVAL;
+			}
+			strncpy(config->prefix_file, optarg, MAX_PATH_LEN);
+			// Delay reading in prefixes until the LPM map is created
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -362,6 +372,11 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			"An interface (-i or --interface) must be provided\n");
 		return -EINVAL;
 	}
+
+	// If user has enabled aggregation but not provided a prefix file,
+	// add a single global aggregation prefix (::0/0)
+	if (config->bpf_config.agg_rtts && strlen(config->prefix_file) == 0)
+		config->add_catchall_prefix = true;
 
 	return 0;
 }
@@ -1117,6 +1132,99 @@ static int add_aggregation_prefix(int map_fd, struct lpm_trie_key *ip_prefix)
 				   BPF_NOEXIST);
 }
 
+static int parse_prefix_str(const char *str, struct lpm_trie_key *prefix)
+{
+	char addr_buf[INET6_ADDRSTRLEN];
+	struct in6_addr ipv6;
+	struct in_addr ipv4;
+	bool is_ipv4 = true;
+	char *split_pos;
+	long prefixlen;
+	int ret;
+
+	split_pos = strchr(str, '/');
+	if (!split_pos || split_pos - str > INET6_ADDRSTRLEN - 1)
+		return -EINVAL;
+
+	// Make string that contains only address (inet_pton() will fail if string also contains prefix)
+	strncpy(addr_buf, str, split_pos - str);
+	addr_buf[split_pos - str] = '\0';
+
+	// Parse prefix
+	ret = inet_pton(AF_INET, addr_buf, &ipv4);
+	if (ret != 1) {
+		ret = inet_pton(AF_INET6, addr_buf, &ipv6);
+		is_ipv4 = false;
+	}
+	if (ret != 1)
+		return -EINVAL;
+
+	// Parse prefix len
+	errno = 0; // Needs to bet set to detect if strtol fails
+	prefixlen = strtol(split_pos + 1, NULL, 10);
+	if (errno)
+		return -errno;
+	if (prefixlen < 0 || ((is_ipv4 && prefixlen > 32) || prefixlen > 128))
+		return -EINVAL;
+
+	// Valid IP prefix - fill prefix struct
+	if (is_ipv4) {
+		memset(&prefix->ip.s6_addr[0], 0, 10);
+		memset(&prefix->ip.s6_addr[10], 0xff, 2);
+		memcpy(&prefix->ip.s6_addr[12], &ipv4, sizeof(ipv4));
+		prefix->prefixlen = prefixlen + 96;
+	} else {
+		prefix->ip = ipv6;
+		prefix->prefixlen = prefixlen;
+	}
+
+	return 0;
+}
+
+static int parse_prefix_file(const char *path, int map_fd)
+{
+	struct lpm_trie_key ip_prefix;
+	char *line = NULL;
+	ssize_t read;
+	size_t len;
+	FILE *fp;
+	int count = 0;
+	int err = 0;
+
+	fp = fopen(path, "r");
+	if (!fp) {
+		err = -errno;
+		fprintf(stderr, "Failed opening %s: %s\n", path,
+			get_libbpf_strerror(err));
+		return err;
+	}
+
+	while ((read = getline(&line, &len, fp)) != -1) {
+		err = parse_prefix_str(line, &ip_prefix);
+		if (err) {
+			fprintf(stderr, "Failed parsing IP-prefix %s: %s\n",
+				line, get_libbpf_strerror(err));
+			break;
+		}
+		err = add_aggregation_prefix(map_fd, &ip_prefix);
+		if (err) {
+			fprintf(stderr, "Failed adding IP-prefix %s: %s\n",
+				line, get_libbpf_strerror(err));
+			break;
+		}
+		count++;
+	}
+
+	if (count == 0) {
+		fprintf(stderr, "No valid IP-prefixes found in %s\n", path);
+		err = err ? err : -EINVAL;
+	}
+
+	free(line);
+	fclose(fp);
+	return err;
+}
+
 static int add_aggregation_prefixes(struct bpf_object *obj,
 				    struct pping_config *config,
 				    const char *map_name)
@@ -1131,14 +1239,18 @@ static int add_aggregation_prefixes(struct bpf_object *obj,
 	if (agg_map_fd < 0)
 		return agg_map_fd;
 
+	if (strlen(config->prefix_file) > 0) {
+		err = parse_prefix_file(config->prefix_file, agg_map_fd);
+		if (err)
+			return err;
+	}
+
 	if (config->add_catchall_prefix) {
 		memset(&ip_prefix, 0, sizeof(ip_prefix));
 		err = add_aggregation_prefix(agg_map_fd, &ip_prefix);
 		if (err)
 			return err;
 	}
-
-	/* TODO - Add additional user-provided IP-prefixes */
 
 	return 0;
 }
