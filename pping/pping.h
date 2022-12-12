@@ -70,7 +70,7 @@ struct bpf_config {
 	bool skip_syn;
 	bool push_individual_events;
 	bool agg_rtts;
-	__u8 reserved;
+	bool agg_by_dst; // dst of reply packet
 };
 
 /*
