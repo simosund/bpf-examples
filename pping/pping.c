@@ -134,6 +134,7 @@ static const struct option long_options[] = {
 	{ "include-SYN",      no_argument,       NULL, 's' }, // Include SYN-packets in tracking (may fill up flow state with half-open connections)
 	{ "aggregate",        required_argument, NULL, 'a' }, // Aggregate RTTs every X seconds instead of reporting them individually
 	{ "prefix-file",      required_argument, NULL, 'p' }, // Path of file containing IP prefixes to aggregate RTTs for
+	{ "agg-by-dst",       no_argument,       NULL, 'd' }, // Aggregate RTTs by dst IP of reply packet (instead of src like default) 
 	{ 0, 0, NULL, 0 }
 };
 
@@ -207,8 +208,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.skip_syn = true;
 	config->bpf_config.push_individual_events = true;
 	config->bpf_config.agg_rtts = false;
+	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:p:",
+	while ((opt = getopt_long(argc, argv, "hflTCsdi:r:R:t:c:F:I:x:a:p:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -356,6 +358,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			}
 			strncpy(config->prefix_file, optarg, MAX_PATH_LEN);
 			// Delay reading in prefixes until the LPM map is created
+			break;
+		case 'd':
+			config->bpf_config.agg_by_dst = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
