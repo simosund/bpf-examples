@@ -969,15 +969,13 @@ static struct aggregated_rtt_stats *lookup_active_agg_map(struct in6_addr *ip)
 	return bpf_map_lookup_elem(agg_map, &key);
 }
 
-static void aggregate_rtt(__u64 rtt, struct in6_addr *ip)
+static void aggregate_rtt(__u64 rtt, struct aggregated_rtt_stats *rtt_agg)
 {
-	struct aggregated_rtt_stats *rtt_agg;
 	__u32 bin_idx;
 
 	if (!config.agg_rtts)
 		return;
 
-	rtt_agg = lookup_active_agg_map(ip);
 	if (!rtt_agg)
 		return;
 
@@ -1036,7 +1034,8 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
  * Attempt to match packet in p_info with a timestamp from flow in f_state
  */
 static void pping_match_packet(struct flow_state *f_state, void *ctx,
-			       struct packet_info *p_info)
+			       struct packet_info *p_info,
+			       struct aggregated_rtt_stats *rtt_agg)
 {
 	__u64 rtt;
 	__u64 *p_ts;
@@ -1064,8 +1063,47 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	f_state->srtt = calculate_srtt(f_state->srtt, rtt);
 
 	send_rtt_event(ctx, rtt, f_state, p_info);
-	aggregate_rtt(rtt, config.agg_by_dst ? &p_info->pid.flow.daddr.ip :
-					       &p_info->pid.flow.saddr.ip);
+	aggregate_rtt(rtt, rtt_agg);
+}
+
+/*
+ * Checks if packet needs to be processed or not, as when aggregating RTTs per
+ * IP prefix there is no need to process packets that don't go to or come from
+ * one of the IP-prefixes.
+ *
+ * If RTTs should be aggregated, it may also set p_info->pid_valid or
+ * p_info->reply_pid_valid to false to indicate that it's unnecessary to
+ * timestamp or match the packet (due to it not going to or comming from a
+ * suitable IP-prefix). Furthermore, if the packet should be matched it also
+ * sets the *rtt_agg to the entry in which the rtt should be aggregated.
+ */
+static bool packet_should_be_processed(struct packet_info *p_info,
+				       struct aggregated_rtt_stats **rtt_agg)
+{
+	struct aggregated_rtt_stats *timestamp_agg = NULL, *match_agg = NULL;
+	*rtt_agg = NULL;
+
+	if (!config.agg_rtts)
+		return true;
+
+	if (p_info->pid_valid) {
+		timestamp_agg = lookup_active_agg_map(
+			config.agg_by_dst ? &p_info->pid.flow.saddr.ip :
+					    &p_info->pid.flow.daddr.ip);
+		if (!timestamp_agg)
+			p_info->pid_valid = false;
+	}
+	if (p_info->reply_pid_valid) {
+		match_agg = lookup_active_agg_map(
+			config.agg_by_dst ? &p_info->pid.flow.daddr.ip :
+					    &p_info->pid.flow.saddr.ip);
+		if (!match_agg)
+			p_info->reply_pid_valid = false;
+		else
+			*rtt_agg = match_agg;
+	}
+
+	return timestamp_agg || match_agg;
 }
 
 /*
@@ -1078,10 +1116,12 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
  */
 static void pping_parsed_packet(void *ctx, struct packet_info *p_info)
 {
-	struct dual_flow_state *df_state;
+	struct dual_flow_state *df_state = NULL;
 	struct flow_state *fw_flow, *rev_flow;
+	struct aggregated_rtt_stats *rtt_agg;
 
-	df_state = lookup_or_create_dualflow_state(ctx, p_info);
+	if (packet_should_be_processed(p_info, &rtt_agg))
+		df_state = lookup_or_create_dualflow_state(ctx, p_info);
 	if (!df_state)
 		return;
 
@@ -1091,7 +1131,7 @@ static void pping_parsed_packet(void *ctx, struct packet_info *p_info)
 
 	rev_flow = get_reverse_flowstate_from_packet(df_state, p_info);
 	update_reverse_flowstate(ctx, p_info, rev_flow);
-	pping_match_packet(rev_flow, ctx, p_info);
+	pping_match_packet(rev_flow, ctx, p_info, rtt_agg);
 
 	close_and_delete_flows(ctx, p_info, fw_flow, rev_flow);
 }
