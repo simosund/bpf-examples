@@ -270,3 +270,36 @@ replies are processed concurrently, it's possible one of them will
 update the flow-open information and emit a flow opening message, but
 another reply closing the flow without thinking it's ever been opened,
 thus not sending a flow closing message.
+
+### Reading and resetting the aggregated stats from userspace
+The userspace program periodically reads and resets the aggregated
+statistics stored in the LPM maps. To avoid the userspace program
+trying to read and reset the map while it's simultaneously updated by
+the BPF programs, a system with two maps is used: one active and on
+inactive. The BPF programs only update the active map while the
+userspace only reads and resets the inactive map. Before the userspace
+attempts to retrieve the most recent stats, it switches the active and
+inactive map, so that the map the BPF programs have been updating with
+aggregated RTT stats until that point becomes the inactive
+map. However, if the userspace program switches the active map after an
+instance of the BPF program has looked up its active map, but before
+the BPF program has updated the aggregated stats, the BPF program will
+update the aggregated stats of what was the active map before the
+userspace switched it, which is now the inactive map that the
+userspace will act on. Depending on how far the userspace process gets
+with fetching and resetting the inactive map, the update from the BPF
+program may either end up being part of the report (if updated before
+the userspace fetches the value), lost (if updated after userspace
+fetches value, but before resetting) or part of the next-next report
+(if updated after userspace resets values).
+
+One potential solution could be to add a spinlock to the map which
+holds the information about which map that is the currently active
+one. The BPF programs would then have to hold the spinlock for the
+duration between when they look up the currently active map to when
+they have finished updating the stats in the active map. To avoid all
+the BPF programs from blocking each other, this map should probably be
+made a per-CPU map in that case. The userspace program would have to
+use `BPF_F_LOCK` when switching the active map, blocking the update
+until all BPF programs have finished updating the currently active
+map.
