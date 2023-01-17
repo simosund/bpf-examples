@@ -138,7 +138,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct network_tuple);
 	__type(value, struct dual_flow_state);
-	__uint(max_entries, 16384);
+	__uint(max_entries, 65536);
 } flow_state SEC(".maps");
 
 struct {
@@ -151,7 +151,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__type(key, struct lpm_trie_key);
 	__type(value, struct aggregated_rtt_stats);
-	__uint(max_entries, 16384);
+	__uint(max_entries, 65536);
 	__uint(map_flags, BPF_F_NO_PREALLOC); // Apparently required for LPM maps
 } agg_map1 SEC(".maps");
 
@@ -1221,7 +1221,8 @@ static void send_flow_timeout_message(void *ctx, struct network_tuple *flow,
 SEC("tc")
 int pping_tc_egress(struct __sk_buff *skb)
 {
-	pping_tc(skb, false);
+	if (!config.dummy_mode)
+		pping_tc(skb, false);
 
 	return TC_ACT_UNSPEC;
 }
@@ -1230,7 +1231,8 @@ int pping_tc_egress(struct __sk_buff *skb)
 SEC("tc")
 int pping_tc_ingress(struct __sk_buff *skb)
 {
-	pping_tc(skb, true);
+	if (!config.dummy_mode)
+		pping_tc(skb, true);
 
 	return TC_ACT_UNSPEC;
 }
@@ -1239,7 +1241,8 @@ int pping_tc_ingress(struct __sk_buff *skb)
 SEC("xdp")
 int pping_xdp_ingress(struct xdp_md *ctx)
 {
-	pping_xdp(ctx);
+	if (!config.dummy_mode)
+		pping_xdp(ctx);
 
 	return XDP_PASS;
 }

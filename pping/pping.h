@@ -71,6 +71,7 @@ struct bpf_config {
 	bool push_individual_events;
 	bool agg_rtts;
 	bool agg_by_dst; // dst of reply packet
+	bool dummy_mode;
 };
 
 /*
