@@ -120,18 +120,28 @@ struct protocol_info {
 	bool wait_first_edge;
 };
 
+#define RUNTIME_BIN_WIDTH 10
+#define RUNTIME_N_BINS 20000
+#define EWMA_WEIGHT 4 // EWMA alpha = 2^-EWMA_WEIGHT
+struct runtime_agg {
+	__u64 ewma; // Actually stores ewma << EWMA_WEIGHT (similar to how srtt is stored - reduces rounding errors)
+	__u64 min;
+	__u64 max;
+	__u32 hist[RUNTIME_N_BINS];
+};
+
 char _license[] SEC("license") = "GPL";
 // Global config struct - set from userspace
 static volatile const struct bpf_config config = {};
 static volatile __u64 last_warn_time[2] = { 0 };
-
+static volatile struct runtime_agg runtimes = { 0 };
 
 // Map definitions
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct packet_id);
 	__type(value, __u64);
-	__uint(max_entries, 16384);
+	__uint(max_entries, 65356);
 } packet_ts SEC(".maps");
 
 struct {
@@ -151,7 +161,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__type(key, struct lpm_trie_key);
 	__type(value, struct aggregated_rtt_stats);
-	__uint(max_entries, 65536);
+	__uint(max_entries, 16384);
 	__uint(map_flags, BPF_F_NO_PREALLOC); // Apparently required for LPM maps
 } agg_map1 SEC(".maps");
 
@@ -1215,14 +1225,34 @@ static void send_flow_timeout_message(void *ctx, struct network_tuple *flow,
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &fe, sizeof(fe));
 }
 
+void static add_runtime_record(__u64 runtime)
+{
+	__u64 bin_idx = runtime / RUNTIME_BIN_WIDTH;
+	if (bin_idx >= RUNTIME_N_BINS)
+		bin_idx = RUNTIME_N_BINS - 1;
+	runtimes.hist[bin_idx]++;
+
+	if (runtime > runtimes.max)
+		runtimes.max = runtime;
+	if (!runtimes.min || runtime < runtimes.min)
+		runtimes.min = runtime;
+	// EWMA calculation inspired by how srtt does it
+	if (runtimes.ewma)
+		runtimes.ewma += runtime - (runtimes.ewma >> EWMA_WEIGHT);
+	else
+		runtimes.ewma = runtime;
+}
+
 // Programs
 
 // Egress path using TC-BPF
 SEC("tc")
 int pping_tc_egress(struct __sk_buff *skb)
 {
+	__u64 start = bpf_ktime_get_ns();
 	if (!config.dummy_mode)
 		pping_tc(skb, false);
+	add_runtime_record(bpf_ktime_get_ns() - start);
 
 	return TC_ACT_UNSPEC;
 }
@@ -1231,8 +1261,10 @@ int pping_tc_egress(struct __sk_buff *skb)
 SEC("tc")
 int pping_tc_ingress(struct __sk_buff *skb)
 {
+	__u64 start = bpf_ktime_get_ns();
 	if (!config.dummy_mode)
 		pping_tc(skb, true);
+	add_runtime_record(bpf_ktime_get_ns() - start);
 
 	return TC_ACT_UNSPEC;
 }
@@ -1241,8 +1273,10 @@ int pping_tc_ingress(struct __sk_buff *skb)
 SEC("xdp")
 int pping_xdp_ingress(struct xdp_md *ctx)
 {
+	__u64 start = bpf_ktime_get_ns();
 	if (!config.dummy_mode)
 		pping_xdp(ctx);
+	add_runtime_record(bpf_ktime_get_ns() - start);
 
 	return XDP_PASS;
 }
