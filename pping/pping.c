@@ -23,6 +23,7 @@ static const char *__doc__ =
 
 #include "json_writer.h"
 #include "pping.h" //common structs for user-space and BPF parts
+#include "lhist.h"
 
 // Maximum string length for IPv6 prefix (including /xxx and '\0')
 #define INET6_PREFIXSTRLEN (INET6_ADDRSTRLEN + 4)
@@ -987,17 +988,6 @@ static void handle_missed_events(void *ctx, int cpu, __u64 lost_cnt)
 	fprintf(stderr, "Lost %llu events on CPU %d\n", lost_cnt, cpu);
 }
 
-static void print_histogram(FILE *stream,
-			    struct aggregated_rtt_stats *rtt_stats)
-{
-	int i;
-
-	fprintf(stream, "[%u", rtt_stats->bins[0]);
-	for (i = 1; i < RTT_AGG_NR_BINS; i++)
-		fprintf(stream, ",%u", rtt_stats->bins[i]);
-	fprintf(stream, "]");
-}
-
 static void print_aggregated_rtts(FILE *stream, __u64 t,
 				  struct lpm_trie_key *ip_prefix,
 				  struct aggregated_rtt_stats *rtt_stats)
@@ -1007,11 +997,19 @@ static void print_aggregated_rtts(FILE *stream, __u64 t,
 
 	print_ns_datetime(stream, t);
 	fprintf(stream,
-		": %s -> min=%llu.%06llu ms, max=%llu.%06llu ms, histogram=",
-		prefixstr, rtt_stats->min / NS_PER_MS,
-		rtt_stats->min % NS_PER_MS, rtt_stats->max / NS_PER_MS,
-		rtt_stats->max % NS_PER_MS);
-	print_histogram(stream, rtt_stats);
+		": %s -> count=%llu, min=%llu.%06llu ms, mean=%.2f ms, median=%.2f ms, p95=%.2f ms, max=%llu.%06llu ms",
+		prefixstr, lhist_count(rtt_stats->bins, RTT_AGG_NR_BINS),
+		rtt_stats->min / NS_PER_MS, rtt_stats->min % NS_PER_MS,
+		lhist_mean(rtt_stats->bins, RTT_AGG_NR_BINS,
+			   RTT_AGG_BIN_WIDTH, 0) /
+		NS_PER_MS,
+		lhist_percentile(rtt_stats->bins, 50, RTT_AGG_NR_BINS,
+				 RTT_AGG_BIN_WIDTH, 0) /
+		NS_PER_MS,
+		lhist_percentile(rtt_stats->bins, 95, RTT_AGG_NR_BINS,
+				 RTT_AGG_BIN_WIDTH, 0) /
+		NS_PER_MS,
+		rtt_stats->max / NS_PER_MS, rtt_stats->max % NS_PER_MS);
 	fprintf(stream, "\n");
 }
 
