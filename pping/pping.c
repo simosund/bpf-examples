@@ -76,6 +76,7 @@ struct map_cleanup_args {
 struct aggregation_args {
 	pthread_t tid;
 	__u64 aggregation_interval;
+	enum PPING_OUTPUT_FORMAT format;
 	int map_fd1;
 	int map_fd2;
 	int map_active_fd;
@@ -983,29 +984,69 @@ static void handle_missed_events(void *ctx, int cpu, __u64 lost_cnt)
 	fprintf(stderr, "Lost %llu events on CPU %d\n", lost_cnt, cpu);
 }
 
-static void print_aggregated_rtts(FILE *stream, __u64 t,
+static void print_aggrtts_standard(FILE *stream, __u64 t, const char *prefixstr,
+				   struct aggregated_rtt_stats *rtt_stats)
+{
+	print_ns_datetime(stream, t);
+	fprintf(stream,
+		": %s -> count=%llu, min=%llu.%06llu ms, mean=%.2f ms, median=%.2f ms, p95=%.2f ms, max=%llu.%06llu ms",
+		prefixstr, lhist_count(rtt_stats->bins, RTT_AGG_NR_BINS),
+		rtt_stats->min / NS_PER_MS, rtt_stats->min % NS_PER_MS,
+		lhist_mean(rtt_stats->bins, RTT_AGG_NR_BINS, RTT_AGG_BIN_WIDTH,
+			   0) /
+			NS_PER_MS,
+		lhist_percentile(rtt_stats->bins, 50, RTT_AGG_NR_BINS,
+				 RTT_AGG_BIN_WIDTH, 0) /
+			NS_PER_MS,
+		lhist_percentile(rtt_stats->bins, 95, RTT_AGG_NR_BINS,
+				 RTT_AGG_BIN_WIDTH, 0) /
+			NS_PER_MS,
+		rtt_stats->max / NS_PER_MS, rtt_stats->max % NS_PER_MS);
+	fprintf(stream, "\n");
+}
+
+static void print_aggrtts_json(json_writer_t *ctx, __u64 t,
+			       const char *prefixstr,
+			       struct aggregated_rtt_stats *rtt_stats)
+{
+	int i;
+
+	jsonw_start_object(ctx);
+	jsonw_u64_field(ctx, "timestamp", convert_monotonic_to_realtime(t));
+	jsonw_string_field(ctx, "ip_prefix", prefixstr);
+	jsonw_u64_field(ctx, "min_rtt", rtt_stats->min);
+	jsonw_float_field(ctx, "mean_rtt",
+			  lhist_mean(rtt_stats->bins, RTT_AGG_NR_BINS,
+				     RTT_AGG_BIN_WIDTH, 0));
+	jsonw_float_field(ctx, "median_rtt",
+			  lhist_percentile(rtt_stats->bins, 50, RTT_AGG_NR_BINS,
+					   RTT_AGG_BIN_WIDTH, 0));
+	jsonw_float_field(ctx, "p95_rtt",
+			  lhist_percentile(rtt_stats->bins, 95, RTT_AGG_NR_BINS,
+					   RTT_AGG_BIN_WIDTH, 0));
+	jsonw_u64_field(ctx, "max_rtt", rtt_stats->max);
+	jsonw_u64_field(ctx, "bin_width", RTT_AGG_BIN_WIDTH);
+
+	jsonw_name(ctx, "histogram");
+	jsonw_start_array(ctx);
+	for (i = 0; i < RTT_AGG_NR_BINS; i++)
+		jsonw_uint(ctx, rtt_stats->bins[i]);
+	jsonw_end_array(ctx);
+
+	jsonw_end_object(ctx);
+}
+
+static void print_aggregated_rtts(enum PPING_OUTPUT_FORMAT format, __u64 t,
 				  struct lpm_trie_key *ip_prefix,
 				  struct aggregated_rtt_stats *rtt_stats)
 {
 	char prefixstr[INET6_PREFIXSTRLEN] = "";
 	format_ipprefix(prefixstr, sizeof(prefixstr), ip_prefix);
 
-	print_ns_datetime(stream, t);
-	fprintf(stream,
-		": %s -> count=%llu, min=%llu.%06llu ms, mean=%.2f ms, median=%.2f ms, p95=%.2f ms, max=%llu.%06llu ms",
-		prefixstr, lhist_count(rtt_stats->bins, RTT_AGG_NR_BINS),
-		rtt_stats->min / NS_PER_MS, rtt_stats->min % NS_PER_MS,
-		lhist_mean(rtt_stats->bins, RTT_AGG_NR_BINS,
-			   RTT_AGG_BIN_WIDTH, 0) /
-		NS_PER_MS,
-		lhist_percentile(rtt_stats->bins, 50, RTT_AGG_NR_BINS,
-				 RTT_AGG_BIN_WIDTH, 0) /
-		NS_PER_MS,
-		lhist_percentile(rtt_stats->bins, 95, RTT_AGG_NR_BINS,
-				 RTT_AGG_BIN_WIDTH, 0) /
-		NS_PER_MS,
-		rtt_stats->max / NS_PER_MS, rtt_stats->max % NS_PER_MS);
-	fprintf(stream, "\n");
+	if (format == PPING_OUTPUT_STANDARD)
+		print_aggrtts_standard(stdout, t, prefixstr, rtt_stats);
+	else
+		print_aggrtts_json(json_ctx, t, prefixstr, rtt_stats);
 }
 
 /* Changes which map the BPF progs use to aggregate the RTTs in.
@@ -1032,7 +1073,8 @@ static int switch_agg_map(int map_fd1, int map_fd2, int map_active_fd)
 	return prev_map == 0 ? map_fd1 : map_fd2;
 }
 
-static int report_aggregated_rtts(int map_active_fd, int map_fd1, int map_fd2)
+static int report_aggregated_rtts(enum PPING_OUTPUT_FORMAT report_format,
+				  int map_active_fd, int map_fd1, int map_fd2)
 {
 	struct aggregated_rtt_stats rtt_stats, empty_stats = { 0 };
 
@@ -1054,7 +1096,8 @@ static int report_aggregated_rtts(int map_active_fd, int map_fd1, int map_fd2)
 
 		// Only print and reset prefixes which have RTT samples
 		if (rtt_stats.max > 0) {
-			print_aggregated_rtts(stdout, t, &key, &rtt_stats);
+			print_aggregated_rtts(report_format, t, &key,
+					      &rtt_stats);
 
 			err = bpf_map_update_elem(agg_map, &key, &empty_stats,
 						  BPF_EXIST);
@@ -1083,8 +1126,8 @@ static void *periodic_rtt_aggregation(void *args)
 
 	argp->err = 0;
 	while (keep_running) {
-		err = report_aggregated_rtts(argp->map_active_fd, argp->map_fd1,
-					     argp->map_fd2);
+		err = report_aggregated_rtts(argp->format, argp->map_active_fd,
+					     argp->map_fd1, argp->map_fd2);
 		if (err) {
 			libbpf_strerror(err, buf, sizeof(buf));
 			fprintf(stderr, "Failed fetching aggregated RTTs: %s\n",
@@ -1525,17 +1568,25 @@ int main(int argc, char *argv[])
 	if (!config.bpf_config.track_tcp && !config.bpf_config.track_icmp)
 		config.bpf_config.track_tcp = true;
 
-	if (config.bpf_config.track_icmp &&
-	    config.output_format == PPING_OUTPUT_PPVIZ)
-		fprintf(stderr,
-			"Warning: ppviz format mainly intended for TCP traffic, but may now include ICMP traffic as well\n");
+	if (config.output_format == PPING_OUTPUT_PPVIZ) {
+		if (config.bpf_config.agg_rtts) {
+			fprintf(stderr,
+				"The ppviz format does not support aggregated output\n");
+			return EXIT_FAILURE;
+		}
+		if (config.bpf_config.track_icmp)
+			fprintf(stderr,
+				"Warning: ppviz format mainly intended for TCP traffic, but may now include ICMP traffic as well\n");
+	}
 
 	switch (config.output_format) {
 	case PPING_OUTPUT_STANDARD:
 		print_event_func = print_event_standard;
+		config.agg_args.format = PPING_OUTPUT_STANDARD;
 		break;
 	case PPING_OUTPUT_JSON:
 		print_event_func = print_event_json;
+		config.agg_args.format = PPING_OUTPUT_JSON;
 		break;
 	case PPING_OUTPUT_PPVIZ:
 		print_event_func = print_event_ppviz;
