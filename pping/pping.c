@@ -926,11 +926,6 @@ static void print_event_json(const union pping_event *e)
 	if (e->event_type != EVENT_TYPE_RTT && e->event_type != EVENT_TYPE_FLOW)
 		return;
 
-	if (!json_ctx) {
-		json_ctx = jsonw_new(stdout);
-		jsonw_start_array(json_ctx);
-	}
-
 	jsonw_start_object(json_ctx);
 	print_common_fields_json(json_ctx, e);
 	if (e->event_type == EVENT_TYPE_RTT)
@@ -1570,6 +1565,11 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
+	if (config.output_format == PPING_OUTPUT_JSON) {
+		json_ctx = jsonw_new(stdout);
+		jsonw_start_array(json_ctx);
+	}
+
 	// Set up perf buffer
 	pb = perf_buffer__new(bpf_object__find_map_fd_by_name(obj,
 							      config.event_map),
@@ -1611,11 +1611,6 @@ int main(int argc, char *argv[])
 	}
 
 	// Cleanup
-	if (config.output_format == PPING_OUTPUT_JSON && json_ctx) {
-		jsonw_end_array(json_ctx);
-		jsonw_destroy(&json_ctx);
-	}
-
 	if (config.agg_args.valid_thread) {
 		pthread_cancel(config.agg_args.tid);
 		pthread_join(config.agg_args.tid, &thread_err);
@@ -1656,6 +1651,11 @@ cleanup_attached_progs:
 		fprintf(stderr,
 			"Failed removing egress program from interface %s: %s\n",
 			config.ifname, get_libbpf_strerror(detach_err));
+
+	if (config.output_format == PPING_OUTPUT_JSON && json_ctx) {
+		jsonw_end_array(json_ctx);
+		jsonw_destroy(&json_ctx);
+	}
 
 	bpf_object__close(obj);
 
