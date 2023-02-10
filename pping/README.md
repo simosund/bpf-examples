@@ -1,16 +1,19 @@
-# PPing using XDP and TC-BPF
-A re-implementation of [Kathie Nichols' passive ping
-(pping)](https://github.com/pollere/pping) utility using XDP (on ingress) and
-TC-BPF (on egress) for the packet capture logic.
+# ePPing - evolved Passive Ping using XDP and tc-BPF
+A re-implementation of [Kathleen Nichols' passive ping
+(pping)](https://github.com/pollere/pping) utility using BPF programs to
+efficiently process packets in the kernel. This eliminates the need for cloning
+packets and sending them to user space like traditional packet capturing
+does. For egress traffic ePPing uses tc-BPF hook and for ingress traffic it can
+either use tc or XDP.
 
 ## Simple description
-Passive Ping (PPing) is a simple tool for passively measuring per-flow RTTs. It
-can be used on endhosts as well as any (BPF-capable Linux) device which can see
-both directions of the traffic (ex router or middlebox). Currently it works for
-TCP traffic which uses the TCP timestamp option and ICMP echo messages, but
-could be extended to also work with for example TCP seq/ACK numbers, the QUIC
-spinbit and DNS queries. See the [TODO-list](./TODO.md) for more potential
-features (which may or may not ever get implemented).
+Evolved Passive Ping (ePPing) is a simple tool for passively measuring per-flow
+RTTs. It can be used on endhosts as well as any (BPF-capable Linux) device which
+can see both directions of the traffic (ex router or middlebox). Currently it
+works for TCP traffic which uses the TCP timestamp option and ICMP echo
+messages, but could be extended to also work with for example TCP seq/ACK
+numbers, the QUIC spinbit and DNS queries. See the [TODO-list](./TODO.md) for
+more potential features (which may or may not ever get implemented).
 
 The fundamental logic of pping is to timestamp a pseudo-unique identifier for
 packets, and then look for matches in the reply packets. If a match is found,
@@ -37,12 +40,17 @@ echo identifer, and thus all instaces of ping originating from a particular
 Windows host and the same target host will be considered a single flow.
 
 ## Output formats
-pping currently supports 3 different formats, *standard*, *ppviz* and *json*. In
-general, the output consists of two different types of events, flow-events which
-gives information that a flow has started/ended, and RTT-events which provides
-information on a computed RTT within a flow.
+ePPing currently supports two different forms out output: individual reports for
+each RTT or periodically aggregated reports per IP-prefix. Additionally, it
+supports 3 different formats for the output (set with the `-F/--format` option):
+*standard*, *ppviz* and *json*.
 
-### Standard format
+### Individual RTT reports
+In the individual RTT reports mode, the output consists of two different types
+of events: flow-events which gives information that a flow has started/ended,
+and RTT-events which provides information on a computed RTT within a flow.
+
+#### Standard format
 The standard format is quite similar to the Kathie's pping default output, and
 is generally intended to be an easily understood human-readable format writing a
 single line per event.
@@ -57,7 +65,7 @@ An example of the format is provided below:
 16:00:49.878508114 TCP 10.11.1.1:5201+10.11.1.2:59528 closing due to RST from dest
 ```
 
-### ppviz format
+#### ppviz format
 The ppviz format is primarily intended to be used to generate data that can be
 visualized by Kathie's [ppviz](https://github.com/pollere/ppviz) tool. The
 format is essentially a CSV format, using a single space as the separator, and
@@ -76,7 +84,7 @@ An example of the format is provided below:
 1623420124.490584753 0.006123511 0.005298909 10.11.1.1:5201+10.11.1.2:59532
 1623420125.492190751 0.005624835 0.005298909 10.11.1.1:5201+10.11.1.2:59532
 ```
-### JSON format
+#### JSON format
 The JSON format is primarily intended to be machine-readable, and thus uses no
 spacing or newlines between entries to reduce the overhead. External tools such
 as [jq](https://stedolan.github.io/jq/) can be used to pretty-print the format.
@@ -120,6 +128,99 @@ An example of a (pretty-printed) RTT-even is provided below:
 }
 ```
 
+### Aggregated output
+The aggregated output form is useful if you are monitoring a lot of traffic
+where reporting individual RTTs can result in an overwhelming amount of
+output. If you are only interested in the overall distribution of the RTTs
+rather than each RTT value, the aggregated output can greatly reduce the amount
+of output and the overhead tied to generating that output when monitoring many
+concurrent flows.
+
+To enable aggregated output, use the `-a/--aggregate <interval>` option.
+
+#### IP prefix input format
+The aggregated mode aggregates RTTs per IP-prefix. To specify which IP-prefixes
+the traffic should be aggregated for, the user can provide a file containing all
+prefixes with the `-p/--prefix-file` option. The input file should list a single
+IP-prefix per line. Both IPv4 and IPv6 prefixes are supported. The RTTs are
+matched on the Longest Prefix Match (LPM), so you may create overlapping
+prefixes to catch RTTs that don't fit a more specific prefix. To catch all RTTs,
+the global prefix ::/0 can be used. If no prefixes are provided all RTTs will be
+aggregated under the global prefix.
+
+An example of the IP-prefix input
+```
+10.11.1.2/32
+10.11.1.0/24
+fc00:dead:cafe:1::2/128
+fc00::/16
+::/0
+```
+
+##### Note on IPv6 and IPv4
+Internally ePPing treats everything as IPv6. IPv4 addresses are under the hood
+mapped to IPv6 ones by prefixing them with ::ffff:0:0/96 in accordance with [RFC
+4291](https://www.rfc-editor.org/rfc/rfc4291.html#section-2.5.5.2). This means
+that if you add an IPv6 prefix which encompasses ::ffff:0:0/96, e.g. ::/0, it
+may contain RTTs from both IPv6 and IPv4 traffic.
+
+
+#### Standard format
+The standard format is intended to provide a human readable overview of RTT
+statistics. An example is provided below:
+```shell
+14:25:46.362191079: 10.11.1.2/32 -> count=10, min=20.343277 ms, mean=57.40 ms, median=65.00 ms, p95=78.90 ms, max=82.978091 ms
+14:25:46.362191079: 10.11.1.0/24 -> count=1256, min=10.316172 ms, mean=50.57 ms, median=50.50 ms, p95=86.50 ms, max=90.034391 ms
+14:25:46.362191079: fc00::/16 -> count=99, min=10.365419 ms, mean=50.70 ms, median=54.50 ms, p95=84.50 ms, max=89.978475 ms
+```
+
+#### ppviz format
+The aggregated output does not support the ppviz format.
+
+#### JSON format
+The JSON format is primarily intended to be machine-readable for later post
+processing. The JSON format includes a histogram of all RTTs, making it possible
+to calculate approximate distribution metrics like mean, variation and
+percentiles.
+
+An example of an aggregated RTT report in JSON format is provided below.
+```json
+{
+    "timestamp": 1676039038377084700,
+    "ip_prefix": "10.11.1.0/24",
+    "min_rtt": 10233155,
+    "mean_rtt": 49960900,
+    "median_rtt": 49500000,
+    "p95_rtt": 85500000,
+    "max_rtt": 90102445,
+    "bin_width": 1000000,
+    "histogram": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      16,
+      15,
+      14,
+      22,
+      10,
+      12,
+      12,
+      13,
+      9,
+      13,
+      ... (output truncuated)
+    ]
+}
+
+```
+
 ## Design and technical description
 !["Design of eBPF pping](./eBPF_pping_design.png)
 
@@ -159,17 +260,15 @@ An example of a (pretty-printed) RTT-even is provided below:
 ## Similar projects
 Passively measuring the RTT for TCP traffic is not a novel concept, and there
 exists a number of other tools that can do so. A good overview of how passive
-RTT calculation using TCP timestamps (as in this project) works is provided in
-[this paper](https://doi.org/10.1145/2523426.2539132) from 2013.
+RTT calculation using TCP timestamps works is provided in [this
+paper](https://doi.org/10.1145/2523426.2539132) from 2013.
 
-- [pping](https://github.com/pollere/pping): This project is largely a
-  re-implementation of Kathie's pping, but by using BPF and XDP as well as
-  implementing some filtering logic the hope is to be able to create a always-on
-  tool that can scale well even to large amounts of massive flows.
+- [pping](https://github.com/pollere/pping): The original PPing tool developed
+  by Kathleen Nichols, which relies on packet capturing (libtins) instead of BPF.
 - [ppviz](https://github.com/pollere/ppviz): Web-based visualization tool for
-  the "machine-friendly" (-m) output from Kathie's pping tool. Running this
-  implementation of pping with --format="ppviz" will generate output that can be
-  used by ppviz.
+  the "machine-friendly" (-m) output from the original PPing. This BPF based
+  ePPing can also generate output that can be used by ppviz by using
+  `--format="ppviz"`.
 - [tcptrace](https://github.com/blitz/tcptrace): A post-processing tool which
   can analyze a tcpdump file and among other things calculate RTTs based on
   seq/ACK numbers (`-r` or `-R` flag).
