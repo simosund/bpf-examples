@@ -18,6 +18,7 @@ static const char *__doc__ =
 #include <signal.h> // For detecting Ctrl-C
 #include <sys/resource.h> // For setting rlmit
 #include <time.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <xdp/libxdp.h>
 
@@ -1222,7 +1223,19 @@ static int parse_prefix_str(const char *str, struct lpm_trie_key *prefix)
 	return 0;
 }
 
-static int parse_prefix_file(const char *path, int map_fd)
+static void cut_first_word(char *str, size_t len)
+{
+	int i;
+
+	for (i = 0; i < len && str[i] != '\0'; i++) {
+		if (str[i] == '#' || isspace(str[i])) {
+			str[i] = '\0';
+			break;
+		}
+	}
+}
+
+static int parse_prefix_file(const char *path, int map_fds[], size_t n_maps)
 {
 	struct lpm_trie_key ip_prefix;
 	char *line = NULL;
@@ -1231,6 +1244,7 @@ static int parse_prefix_file(const char *path, int map_fd)
 	FILE *fp;
 	int count = 0;
 	int err = 0;
+	int i;
 
 	fp = fopen(path, "r");
 	if (!fp) {
@@ -1241,18 +1255,29 @@ static int parse_prefix_file(const char *path, int map_fd)
 	}
 
 	while ((read = getline(&line, &len, fp)) != -1) {
+		cut_first_word(line,
+			       read); // Allow comments/junk after first word
+		if (line[0] == '\0') // Skip empty lines
+			continue;
+
 		err = parse_prefix_str(line, &ip_prefix);
 		if (err) {
 			fprintf(stderr, "Failed parsing IP-prefix %s: %s\n",
 				line, get_libbpf_strerror(err));
-			break;
+			continue;
 		}
-		err = add_aggregation_prefix(map_fd, &ip_prefix);
-		if (err) {
-			fprintf(stderr, "Failed adding IP-prefix %s: %s\n",
-				line, get_libbpf_strerror(err));
-			break;
+
+		for (i = 0; i < n_maps; i++) {
+			err = add_aggregation_prefix(map_fds[i], &ip_prefix);
+			if (err) {
+				fprintf(stderr,
+					"Failed adding IP-prefix %s to map %d: %s\n",
+					line, map_fds[i],
+					get_libbpf_strerror(err));
+				goto exit;
+			}
 		}
+
 		count++;
 	}
 
@@ -1261,27 +1286,34 @@ static int parse_prefix_file(const char *path, int map_fd)
 		err = err ? err : -EINVAL;
 	}
 
+exit:
 	free(line);
 	fclose(fp);
 	return err;
 }
 
 static int add_aggregation_prefixes(struct bpf_object *obj,
-				    struct pping_config *config,
-				    const char *map_name)
+				    struct pping_config *config)
 {
-	int agg_map_fd, err;
+	char *map_names[] = { config->agg_map1, config->agg_map2 };
 	struct lpm_trie_key ip_prefix;
+	int agg_map_fd, err, i;
+	const int n_maps = 2;
+	int map_fds[n_maps];
 
 	if (!config->bpf_config.agg_rtts)
 		return 0;
 
-	agg_map_fd = bpf_object__find_map_fd_by_name(obj, map_name);
-	if (agg_map_fd < 0)
-		return agg_map_fd;
+	for (i = 0; i < n_maps; i++) {
+		agg_map_fd = bpf_object__find_map_fd_by_name(obj, map_names[i]);
+		if (agg_map_fd < 0) {
+			return agg_map_fd;
+		}
+		map_fds[i] = agg_map_fd;
+	}
 
 	if (strlen(config->prefix_file) > 0) {
-		err = parse_prefix_file(config->prefix_file, agg_map_fd);
+		err = parse_prefix_file(config->prefix_file, map_fds, n_maps);
 		if (err)
 			return err;
 	}
@@ -1361,9 +1393,7 @@ static int load_attach_bpfprogs(struct bpf_object **obj,
 	 * cannot separate the load and attach stages in a convenient way.
 	 * Instead simply set up the prefixes before the egress part is also
 	 * attached (before we should be able to get any actual RTTs). */
-	err = add_aggregation_prefixes(*obj, config, config->agg_map1);
-	if (!err)
-		err = add_aggregation_prefixes(*obj, config, config->agg_map2);
+	err = add_aggregation_prefixes(*obj, config);
 	if (err) {
 		fprintf(stderr,
 			"Failed setting up IP-prefixes for aggregation: %s\n",
