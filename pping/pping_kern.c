@@ -969,13 +969,16 @@ static struct aggregated_rtt_stats *lookup_active_agg_map(struct in6_addr *ip)
 	return bpf_map_lookup_elem(agg_map, &key);
 }
 
-static void aggregate_rtt(__u64 rtt, struct aggregated_rtt_stats *rtt_agg)
+static void aggregate_rtt(__u64 rtt, struct aggregated_rtt_stats *rtt_agg,
+			  struct in6_addr *ip)
 {
 	__u32 bin_idx;
 
 	if (!config.agg_rtts)
 		return;
 
+	if (!config.lpm_filter)
+		rtt_agg = lookup_active_agg_map(ip);
 	if (!rtt_agg)
 		return;
 
@@ -1063,7 +1066,9 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	f_state->srtt = calculate_srtt(f_state->srtt, rtt);
 
 	send_rtt_event(ctx, rtt, f_state, p_info);
-	aggregate_rtt(rtt, rtt_agg);
+	aggregate_rtt(rtt, rtt_agg,
+		      config.agg_by_dst ? &p_info->pid.flow.saddr.ip :
+					  &p_info->pid.flow.daddr.ip);
 }
 
 /*
@@ -1083,7 +1088,7 @@ static bool packet_should_be_processed(struct packet_info *p_info,
 	struct aggregated_rtt_stats *timestamp_agg = NULL, *match_agg = NULL;
 	*rtt_agg = NULL;
 
-	if (!config.agg_rtts)
+	if (!config.agg_rtts || !config.lpm_filter)
 		return true;
 
 	if (p_info->pid_valid) {
