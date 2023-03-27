@@ -153,7 +153,22 @@ struct {
 	__type(value, struct aggregated_rtt_stats);
 	__uint(max_entries, 16384);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
-} agg_map SEC(".maps");
+} agg_map1 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__type(key, struct in6_addr);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} agg_map2 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 1);
+} active_agg_map SEC(".maps");
 
 /* struct aggregated_rtt_stats is too large to fit on the stack,
  * so store an empty on in this map that may be used to create new
@@ -968,10 +983,18 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
 {
 	struct aggregated_rtt_stats *agg;
 	struct in6_addr key;
+	__u32 *map_choice;
+	void *active_map;
 	__u32 zero = 0;
 
 	create_ipprefix_key(&key, ip, ipv);
-	agg = bpf_map_lookup_elem(&agg_map, &key);
+
+	map_choice = bpf_map_lookup_elem(&active_agg_map, &zero);
+	if (!map_choice)
+		return NULL;
+	active_map = *map_choice == 0 ? (void *)&agg_map1 : (void *)&agg_map2;
+
+	agg = bpf_map_lookup_elem(active_map, &key);
 	if (agg)
 		return agg;
 
@@ -979,10 +1002,10 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
 	if (!agg)
 		return NULL;
 
-	if (bpf_map_update_elem(&agg_map, &key, agg, BPF_NOEXIST) != 0)
+	if (bpf_map_update_elem(active_map, &key, agg, BPF_NOEXIST) != 0)
 		return NULL;
 
-	return bpf_map_lookup_elem(&agg_map, &key);
+	return bpf_map_lookup_elem(active_map, &key);
 }
 
 static void aggregate_rtt(__u64 rtt, struct in6_addr *ip, __u8 ipv)
