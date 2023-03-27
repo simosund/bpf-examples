@@ -147,6 +147,32 @@ struct {
 	__uint(value_size, sizeof(__u32));
 } events SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__type(key, __u32);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} map_v4_agg SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__type(key, __u64);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} map_v6_agg SEC(".maps");
+
+
+/* struct aggregated_rtt_stats is too large to fit on the stack,
+ * so store an empty on in this map that may be used to create new
+ * entries (with bpf_map_update_elem()) in the map_v*_agg */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 1);
+} empty_rtt_agg SEC(".maps");
 
 // Help functions
 
@@ -637,6 +663,9 @@ static bool is_rate_limited(__u64 now, __u64 last_ts, __u64 rtt)
 static void send_flow_open_event(void *ctx, struct packet_info *p_info,
 				 struct flow_state *rev_flow)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct flow_event fe = {
 		.event_type = EVENT_TYPE_FLOW,
 		.flow_event_type = FLOW_EVENT_OPENING,
@@ -660,6 +689,9 @@ static void send_flow_open_event(void *ctx, struct packet_info *p_info,
 static void send_flow_event(void *ctx, struct packet_info *p_info,
 			    bool rev_flow)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct flow_event fe = {
 		.event_type = EVENT_TYPE_FLOW,
 		.flow_event_type = p_info->event_type,
@@ -704,8 +736,11 @@ static void send_map_full_event(void *ctx, struct packet_info *p_info,
 }
 
 static void send_rtt_event(void *ctx, __u64 rtt, struct flow_state *f_state,
-			  struct packet_info *p_info)
+			   struct packet_info *p_info)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct rtt_event re = {
 		.event_type = EVENT_TYPE_RTT,
 		.timestamp = p_info->time,
@@ -923,6 +958,66 @@ static bool is_new_identifier(struct packet_id *pid, struct flow_state *f_state)
 	return pid->identifier != f_state->last_id;
 }
 
+static void create_ipprefix_key(__u64 *prefix_key, struct in6_addr *ip,
+				__u8 ipv)
+{
+	*prefix_key = 0;
+	if (ipv == AF_INET) {
+		*prefix_key = 0; // Need to ensure entire key is initialized, as next statement only sets first 32 bits
+		*(__u32 *)prefix_key =
+			ip->s6_addr32[3] & config.ipv4_prefix_mask;
+	} else {
+		*prefix_key = *(__u64 *)&ip->in6_u & config.ipv6_prefix_mask;
+		// *prefix_key = *(__u64 *)ip & config.ipv6_prefix_mask; // gives verifier rejection "misaligned stack access off"
+	}
+}
+
+static struct aggregated_rtt_stats *
+lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
+{
+	void *agg_map =
+		ipv == AF_INET ? (void *)&map_v4_agg : (void *)&map_v6_agg;
+	struct aggregated_rtt_stats *agg;
+	__u32 zero = 0;
+	__u64 key;
+
+	create_ipprefix_key(&key, ip, ipv);
+	agg = bpf_map_lookup_elem(agg_map, &key);
+	if (agg)
+		return agg;
+
+	agg = bpf_map_lookup_elem(&empty_rtt_agg, &zero);
+	if (!agg)
+		return NULL;
+
+	if (bpf_map_update_elem(agg_map, &key, agg, BPF_NOEXIST) != 0)
+		return NULL;
+
+	return bpf_map_lookup_elem(agg_map, &key);
+}
+
+static void aggregate_rtt(__u64 rtt, struct in6_addr *ip, __u8 ipv)
+{
+	if (!config.agg_rtts)
+		return;
+
+	struct aggregated_rtt_stats *rtt_agg;
+	int bin_idx;
+
+	rtt_agg = lookup_or_create_aggregation_stats(ip, ipv);
+	if (!rtt_agg)
+		return;
+
+	if (!rtt_agg->min || rtt < rtt_agg->min)
+		rtt_agg->min = rtt;
+	if (rtt > rtt_agg->max)
+		rtt_agg->max = rtt;
+
+	bin_idx = rtt / RTT_AGG_BIN_WIDTH;
+	bin_idx = bin_idx >= RTT_AGG_NR_BINS ? RTT_AGG_NR_BINS - 1 : bin_idx;
+	rtt_agg->bins[bin_idx]++;
+}
+
 /*
  * Attempt to create a timestamp-entry for packet p_info for flow in f_state
  */
@@ -996,6 +1091,7 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	f_state->srtt = calculate_srtt(f_state->srtt, rtt);
 
 	send_rtt_event(ctx, rtt, f_state, p_info);
+	aggregate_rtt(rtt, &p_info->pid.flow.saddr.ip, p_info->pid.flow.ipv);
 }
 
 /*
@@ -1087,6 +1183,9 @@ static bool is_flow_old(struct network_tuple *flow, struct flow_state *f_state,
 static void send_flow_timeout_message(void *ctx, struct network_tuple *flow,
 				      __u64 time)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct flow_event fe = {
 		.event_type = EVENT_TYPE_FLOW,
 		.flow_event_type = FLOW_EVENT_CLOSING,
