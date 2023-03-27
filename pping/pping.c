@@ -143,6 +143,7 @@ static const struct option long_options[] = {
 	{ "aggregate",            required_argument, NULL, 'a' }, // Aggregate RTTs every X seconds instead of reporting them individually
         { "aggregate-subnets-v4", required_argument, NULL, '4' }, // Set the subnet size for IPv4 when aggregating (default 24)
 	{ "aggregate-subnets-v6", required_argument, NULL, '6' }, // Set the subnet size for IPv6 when aggregating (default 48)
+	{ "aggregate-reverse",    no_argument,       NULL, 'e' }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -215,8 +216,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.skip_syn = true;
 	config->bpf_config.push_individual_events = true;
 	config->bpf_config.agg_rtts = false;
+	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:4:6:",
+	while ((opt = getopt_long(argc, argv, "hflTCsei:r:R:t:c:F:I:x:a:4:6:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -354,6 +356,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			if (err)
 				return -EINVAL;
 			config->agg_conf.ipv6_prefix_len = user_val;
+			break;
+		case 'e':
+			config->bpf_config.agg_by_dst = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
