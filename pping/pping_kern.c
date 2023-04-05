@@ -89,6 +89,7 @@ struct parsing_context {
  */
 struct packet_info {
 	__u64 time;                  // Arrival time of packet
+	__u32 pkt_len;               // Size of packet (including headers)
 	__u32 payload;               // Size of packet data (excluding headers)
 	struct packet_id pid;        // flow + identifier to timestamp (ex. TSval)
 	struct packet_id reply_pid;  // rev. flow + identifier to match against (ex. TSecr)
@@ -539,6 +540,7 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 	} transporth_ptr;
 
 	p_info->time = bpf_ktime_get_ns();
+	p_info->pkt_len = pctx->pkt_len;
 	proto = parse_ethhdr(&pctx->nh, pctx->data_end, &eth);
 
 	// Parse IPv4/6 header
