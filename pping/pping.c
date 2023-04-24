@@ -79,6 +79,7 @@ struct aggregation_config {
 	__u8 ipv4_prefix_len;
 	__u8 ipv6_prefix_len;
 	enum PPING_OUTPUT_FORMAT format;
+	bool truncate_histograms;
 };
 
 struct aggregation_maps {
@@ -150,6 +151,7 @@ static const struct option long_options[] = {
 	{ "aggregate-subnets-v6", required_argument, NULL, '6' }, // Set the subnet size for IPv6 when aggregating (default 48)
 	{ "aggregate-reverse",    no_argument,       NULL, 'e' }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
 	{ "aggregate-timeout",    required_argument, NULL, 'o' }, // Interval for timing out subnet entries in seconds (default 30s)
+	{ "truncate-histograms",  no_argument,       NULL, 'u' }, // Truncate trailing zeros from JSON histograms
 	{ 0, 0, NULL, 0 }
 };
 
@@ -216,6 +218,8 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->ifindex = 0;
 	config->force = false;
 
+	config->agg_conf.truncate_histograms = false;
+
 	config->bpf_config.localfilt = true;
 	config->bpf_config.track_tcp = false;
 	config->bpf_config.track_icmp = false;
@@ -224,7 +228,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsei:r:R:t:c:F:I:x:a:4:6:o:",
+	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -374,6 +378,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 				return -EINVAL;
 			config->agg_conf.timeout_interval =
 				user_val * NS_PER_SECOND;
+			break;
+		case 'u':
+			config->agg_conf.truncate_histograms = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -1098,7 +1105,7 @@ static void print_aggrtts_json(json_writer_t *ctx, __u64 t,
 			       struct aggregated_rtt_stats *rtt_stats,
 			       struct aggregation_config *agg_conf)
 {
-	int nb = agg_conf->n_bins, bw = agg_conf->bin_width, i;
+	int nb = agg_conf->n_bins, bw = agg_conf->bin_width, max_bins, i;
 
 	jsonw_start_object(ctx);
 	jsonw_u64_field(ctx, "timestamp", convert_monotonic_to_realtime(t));
@@ -1124,7 +1131,10 @@ static void print_aggrtts_json(json_writer_t *ctx, __u64 t,
 
 	jsonw_name(ctx, "histogram");
 	jsonw_start_array(ctx);
-	for (i = 0; i < nb; i++)
+	max_bins = nb;
+	if (agg_conf->truncate_histograms && rtt_stats->max / bw < nb)
+		max_bins = rtt_stats->max / bw + 1;
+	for (i = 0; i < max_bins; i++)
 		jsonw_uint(ctx, rtt_stats->bins[i]);
 	jsonw_end_array(ctx);
 
@@ -1508,8 +1518,7 @@ int fetch_aggregation_map_fds(struct bpf_object *obj,
 			for (backup = 0; backup < 2; backup++) {
 				snprintf(map_name, sizeof(map_name),
 					 "map_v%d_agg%s%d", ipv,
-					 backup ? "_backup" : "",
-					 instance + 1);
+					 backup ? "_backup" : "", instance + 1);
 
 				fd = bpf_object__find_map_fd_by_name(obj,
 								     map_name);
