@@ -85,6 +85,8 @@ struct aggregation_maps {
 	int map_active_fd;
 	int map_v4_fd[2];
 	int map_v6_fd[2];
+	int map_v4_backup_fd[2];
+	int map_v6_backup_fd[2];
 };
 
 // Structure to contain arguments for periodic_rtt_aggregation (for passing
@@ -1178,7 +1180,7 @@ static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 	struct aggregated_rtt_stats merged_stats;
 	int n_cpus = libbpf_num_possible_cpus();
 	void *cur_key = NULL;
-	__u64 next_key, del_key;
+	__u64 del_key, next_key = 0;
 	bool del_prev = false;
 	int err;
 
@@ -1217,7 +1219,8 @@ static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 				goto exit;
 		}
 
-		if (agg_conf->timeout_interval > 0 &&
+		if (prefix_len > 0 && // Never delete /0 entries (pointless for normal maps and would fail for backup maps)
+		    agg_conf->timeout_interval > 0 &&
 		    merged_stats.last_updated < t_monotonic &&
 		    t_monotonic - merged_stats.last_updated >
 			    agg_conf->timeout_interval) {
@@ -1253,8 +1256,23 @@ static int report_aggregated_rtts(struct aggregation_maps *maps,
 	if (err)
 		return err;
 
+	/* Abuse that the only key (0) of the backup maps will be interpreted
+	 * as 0.0.0.0 (IPv4) or :: (IPv6) to reuse the same function for
+	 * reporting the backup entries despite different map types
+	 * (array vs hash).
+	 * Consider the backup entry to have prefix length 0. */
+	err = report_aggregated_rtt_map(maps->map_v4_backup_fd[map_idx],
+					AF_INET, 0, t, agg_conf);
+	if (err)
+		return err;
+
 	err = report_aggregated_rtt_map(maps->map_v6_fd[map_idx], AF_INET6,
 					agg_conf->ipv6_prefix_len, t, agg_conf);
+	if (err)
+		return err;
+
+	err = report_aggregated_rtt_map(maps->map_v6_backup_fd[map_idx],
+					AF_INET6, 0, t, agg_conf);
 	return err;
 }
 
@@ -1461,7 +1479,7 @@ int fetch_aggregation_map_fds(struct bpf_object *obj,
 			      struct aggregation_maps *maps)
 {
 	char map_name[64];
-	int fd, ipv, instance;
+	int fd, ipv, instance, backup;
 	int *fd_dst;
 
 	fd = bpf_object__find_map_fd_by_name(obj, "map_active_agg_instance");
@@ -1474,19 +1492,33 @@ int fetch_aggregation_map_fds(struct bpf_object *obj,
 
 	for (ipv = 4; ipv <= 6; ipv += 2) {
 		for (instance = 0; instance < 2; instance++) {
-			snprintf(map_name, sizeof(map_name), "map_v%d_agg%d",
-				 ipv, instance + 1);
+			for (backup = 0; backup < 2; backup++) {
+				snprintf(map_name, sizeof(map_name),
+					 "map_v%d_agg%s%d", ipv,
+					 backup ? "_backup" : "",
+					 instance + 1);
 
-			fd = bpf_object__find_map_fd_by_name(obj, map_name);
-			if (fd < 0) {
-				fprintf(stderr,
-					"Unable to find aggregation map %s: %s\n",
-					map_name, get_libbpf_strerror(fd));
-				return fd;
+				fd = bpf_object__find_map_fd_by_name(obj,
+								     map_name);
+				if (fd < 0) {
+					fprintf(stderr,
+						"Unable to find aggregation map %s: %s\n",
+						map_name,
+						get_libbpf_strerror(fd));
+					return fd;
+				}
+
+				fd_dst =
+					ipv == 4 ?
+						(backup ?
+							 maps->map_v4_backup_fd :
+							 maps->map_v4_fd) :
+						(backup ?
+							 maps->map_v6_backup_fd :
+							 maps->map_v6_fd);
+
+				*(fd_dst + instance) = fd;
 			}
-
-			fd_dst = ipv == 4 ? maps->map_v4_fd : maps->map_v6_fd;
-			*(fd_dst + instance) = fd;
 		}
 	}
 

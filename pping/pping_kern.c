@@ -11,6 +11,7 @@
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
 #include <stdbool.h>
+#include <errno.h>
 
 // overwrite xdp/parsing_helpers.h value to avoid hitting verifier limit
 #ifdef IPV6_EXT_MAX_CHAIN
@@ -179,6 +180,34 @@ struct {
 	__uint(max_entries, 16384);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } map_v6_agg2 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 1);
+} map_v4_agg_backup1 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 1);
+} map_v4_agg_backup2 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 1);
+} map_v6_agg_backup1 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 1);
+} map_v6_agg_backup2 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -1004,6 +1033,7 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
 	void *agg_map;
 	__u32 zero = 0;
 	__u64 key;
+	int err;
 
 	map_choice = bpf_map_lookup_elem(&map_active_agg_instance, &zero);
 	if (!map_choice)
@@ -1024,8 +1054,18 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
 	if (!agg)
 		return NULL;
 
-	if (bpf_map_update_elem(agg_map, &key, agg, BPF_NOEXIST) != 0)
-		return NULL;
+	err = bpf_map_update_elem(agg_map, &key, agg, BPF_NOEXIST);
+	if (err && err != -EEXIST) {
+		// No space left in aggregation map - switch to backup entry
+		agg_map = ipv == AF_INET ?
+				  (*map_choice == 0 ?
+					   (void *)&map_v4_agg_backup1 :
+					   (void *)&map_v4_agg_backup2) :
+				  (*map_choice == 0 ?
+					   (void *)&map_v6_agg_backup1 :
+					   (void *)&map_v6_agg_backup2);
+		key = 0;
+	}
 
 	return bpf_map_lookup_elem(agg_map, &key);
 }
