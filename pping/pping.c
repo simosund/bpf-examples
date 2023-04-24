@@ -73,6 +73,7 @@ struct map_cleanup_args {
 
 struct aggregation_config {
 	__u64 aggregation_interval;
+	__u64 timeout_interval;
 	__u64 n_bins;
 	__u64 bin_width;
 	__u8 ipv4_prefix_len;
@@ -146,6 +147,7 @@ static const struct option long_options[] = {
         { "aggregate-subnets-v4", required_argument, NULL, '4' }, // Set the subnet size for IPv4 when aggregating (default 24)
 	{ "aggregate-subnets-v6", required_argument, NULL, '6' }, // Set the subnet size for IPv6 when aggregating (default 48)
 	{ "aggregate-reverse",    no_argument,       NULL, 'e' }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
+	{ "aggregate-timeout",    required_argument, NULL, 'o' }, // Interval for timing out subnet entries in seconds (default 30s)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -220,7 +222,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsei:r:R:t:c:F:I:x:a:4:6:",
+	while ((opt = getopt_long(argc, argv, "hflTCsei:r:R:t:c:F:I:x:a:4:6:o:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -361,6 +363,15 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			break;
 		case 'e':
 			config->bpf_config.agg_by_dst = true;
+			break;
+		case 'o':
+			err = parse_bounded_double(&user_val, optarg, 0,
+						   7 * S_PER_DAY,
+						   "aggregate-timeout");
+			if (err)
+				return -EINVAL;
+			config->agg_conf.timeout_interval =
+				user_val * NS_PER_SECOND;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -1078,6 +1089,9 @@ merge_percpu_aggreated_rtts(struct aggregated_rtt_stats *percpu_stats,
 	memset(merged_stats, 0, sizeof(*merged_stats));
 
 	for (i = 0; i < n_cpus; i++) {
+		if (percpu_stats[i].last_updated > merged_stats->last_updated)
+			merged_stats->last_updated = percpu_stats[i].last_updated;
+
 		if (aggregated_rtt_stats_empty(&percpu_stats[i]))
 			continue;
 
@@ -1090,6 +1104,16 @@ merge_percpu_aggreated_rtts(struct aggregated_rtt_stats *percpu_stats,
 		for (bin = 0; bin < n_bins; bin++)
 			merged_stats->bins[bin] += percpu_stats[i].bins[bin];
 	}
+}
+
+static void
+copy_percpu_rttstats_lastupdated(struct aggregated_rtt_stats *dst,
+				 const struct aggregated_rtt_stats *src,
+				 int n_cpus)
+{
+	int i;
+	for (i = 0; i < n_cpus; i++)
+		dst[i].last_updated = src[i].last_updated;
 }
 
 /* Changes which map the BPF progs use to aggregate the RTTs in.
@@ -1120,16 +1144,17 @@ static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 				     __u64 t_monotonic,
 				     struct aggregation_config *agg_conf)
 {
-	struct aggregated_rtt_stats *percpu_stats = NULL, *empty_stats = NULL;
+	struct aggregated_rtt_stats *percpu_stats = NULL, *cleared_stats = NULL;
 	struct aggregated_rtt_stats merged_stats;
 	int n_cpus = libbpf_num_possible_cpus();
 	void *cur_key = NULL;
-	__u64 next_key;
+	__u64 next_key, del_key;
+	bool del_prev = false;
 	int err;
 
 	percpu_stats = malloc(sizeof(*percpu_stats) * n_cpus);
-	empty_stats = calloc(n_cpus, sizeof(*empty_stats));
-	if (!percpu_stats || !empty_stats) {
+	cleared_stats = calloc(n_cpus, sizeof(*cleared_stats));
+	if (!percpu_stats || !cleared_stats) {
 		err = -ENOMEM;
 		goto exit;
 	}
@@ -1139,6 +1164,13 @@ static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 		if (err)
 			goto exit;
 
+		if (del_prev) {
+			del_prev = false;
+			err = bpf_map_delete_elem(map_fd, &del_key);
+			if (err)
+				goto exit;
+		}
+
 		merge_percpu_aggreated_rtts(percpu_stats, &merged_stats,
 					    n_cpus, agg_conf->n_bins);
 		// Only print prefixes which have RTT samples
@@ -1147,19 +1179,31 @@ static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 					      prefix_len, &merged_stats,
 					      agg_conf);
 
+			copy_percpu_rttstats_lastupdated(cleared_stats,
+							 percpu_stats, n_cpus);
 			err = bpf_map_update_elem(map_fd, &next_key,
-						  empty_stats, BPF_EXIST);
+						  cleared_stats, BPF_EXIST);
 			if (err)
 				goto exit;
+		}
+
+		if (agg_conf->timeout_interval > 0 &&
+		    merged_stats.last_updated < t_monotonic &&
+		    t_monotonic - merged_stats.last_updated >
+			    agg_conf->timeout_interval) {
+			del_prev = true;
+			del_key = next_key;
 		}
 
 		cur_key = &next_key;
 	}
 	if (err == -ENOENT) // Reached end of map
 		err = 0;
+	if (del_prev)
+		err = bpf_map_delete_elem(map_fd, &del_key);
 
 exit:
-	free(empty_stats);
+	free(cleared_stats);
 	free(percpu_stats);
 	return err;
 }
@@ -1465,10 +1509,11 @@ int main(int argc, char *argv[])
 		.clean_args = { .cleanup_interval = 1 * NS_PER_SECOND,
 				.valid_thread = false },
 		.agg_conf = { .aggregation_interval = 1 * NS_PER_SECOND,
+			      .timeout_interval = 30 * NS_PER_SECOND,
 			      .ipv4_prefix_len = 24,
 			      .ipv6_prefix_len = 48,
 			      .n_bins = RTT_AGG_NR_BINS,
-			      .bin_width = RTT_AGG_BIN_WIDTH},
+			      .bin_width = RTT_AGG_BIN_WIDTH },
 		.agg_args = { .valid_thread = false },
 		.object_path = "pping_kern.o",
 		.ingress_prog = PROG_INGRESS_TC,

@@ -1028,7 +1028,7 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
 	return bpf_map_lookup_elem(agg_map, &key);
 }
 
-static void aggregate_rtt(__u64 rtt, struct in6_addr *ip, __u8 ipv)
+static void aggregate_rtt(__u64 rtt, __u64 t, struct in6_addr *ip, __u8 ipv)
 {
 	if (!config.agg_rtts)
 		return;
@@ -1039,6 +1039,8 @@ static void aggregate_rtt(__u64 rtt, struct in6_addr *ip, __u8 ipv)
 	rtt_agg = lookup_or_create_aggregation_stats(ip, ipv);
 	if (!rtt_agg)
 		return;
+
+	rtt_agg->last_updated = t;
 
 	if (!rtt_agg->min || rtt < rtt_agg->min)
 		rtt_agg->min = rtt;
@@ -1123,7 +1125,7 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	f_state->srtt = calculate_srtt(f_state->srtt, rtt);
 
 	send_rtt_event(ctx, rtt, f_state, p_info);
-	aggregate_rtt(rtt,
+	aggregate_rtt(rtt, p_info->time,
 		      config.agg_by_dst ? &p_info->pid.flow.daddr.ip :
 					  &p_info->pid.flow.saddr.ip,
 		      p_info->pid.flow.ipv);
