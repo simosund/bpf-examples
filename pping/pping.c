@@ -79,8 +79,9 @@ struct aggregation_config {
 };
 
 struct aggregation_maps {
-	int map_v4_fd;
-	int map_v6_fd;
+	int map_active_fd;
+	int map_v4_fd[2];
+	int map_v6_fd[2];
 };
 
 // Structure to contain arguments for periodic_rtt_aggregation (for passing
@@ -1000,9 +1001,9 @@ static void print_histogram(FILE *stream,
 {
 	int i;
 
-	fprintf(stream, "[%llu", rtt_stats->bins[0]);
+	fprintf(stream, "[%u", rtt_stats->bins[0]);
 	for (i = 1; i < n_bins; i++)
-		fprintf(stream, ",%llu", rtt_stats->bins[i]);
+		fprintf(stream, ",%u", rtt_stats->bins[i]);
 	fprintf(stream, "]");
 }
 
@@ -1053,11 +1054,35 @@ merge_percpu_aggreated_rtts(struct aggregated_rtt_stats *percpu_stats,
 	}
 }
 
+/* Changes which map the BPF progs use to aggregate the RTTs in.
+ * On success returns the map idx that the BPF progs used BEFORE the switch
+ * (and thus the map filled with data up until the switch, but no longer
+ * beeing activly used by the BPF progs).
+ * On failure returns a negative error code */
+static int switch_agg_map(int map_active_fd)
+{
+	__u32 prev_map, next_map, key = 0;
+	int err;
+
+	// Get current map being used by BPF progs
+	err = bpf_map_lookup_elem(map_active_fd, &key, &prev_map);
+	if (err)
+		return err;
+
+	// Swap map being used by BPF progs to agg RTTs in
+	next_map = prev_map == 1 ? 0 : 1;
+	err = bpf_map_update_elem(map_active_fd, &key, &next_map, BPF_EXIST);
+	if (err)
+		return err;
+
+	return prev_map;
+}
+
 static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 				     __u64 t_monotonic,
 				     struct aggregation_config *agg_conf)
 {
-	struct aggregated_rtt_stats *percpu_stats = NULL;
+	struct aggregated_rtt_stats *percpu_stats = NULL, *empty_stats = NULL;
 	struct aggregated_rtt_stats merged_stats;
 	int n_cpus = libbpf_num_possible_cpus();
 	void *cur_key = NULL;
@@ -1065,27 +1090,38 @@ static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 	int err;
 
 	percpu_stats = malloc(sizeof(*percpu_stats) * n_cpus);
-	if (!percpu_stats)
-		return -errno;
+	empty_stats = calloc(n_cpus, sizeof(*empty_stats));
+	if (!percpu_stats || !empty_stats) {
+		err = -ENOMEM;
+		goto exit;
+	}
 
 	while ((err = bpf_map_get_next_key(map_fd, cur_key, &next_key)) == 0) {
 		err = bpf_map_lookup_elem(map_fd, &next_key, percpu_stats);
 		if (err)
-			break;
+			goto exit;
 
 		merge_percpu_aggreated_rtts(percpu_stats, &merged_stats,
 					    n_cpus, agg_conf->n_bins);
 		// Only print prefixes which have RTT samples
-		if (!aggregated_rtt_stats_empty(&merged_stats))
+		if (!aggregated_rtt_stats_empty(&merged_stats)) {
 			print_aggregated_rtts(stdout, t_monotonic, &next_key,
 					      af, prefix_len, &merged_stats,
 					      agg_conf);
+
+			err = bpf_map_update_elem(map_fd, &next_key,
+						  empty_stats, BPF_EXIST);
+			if (err)
+				goto exit;
+		}
 
 		cur_key = &next_key;
 	}
 	if (err == -ENOENT) // Reached end of map
 		err = 0;
 
+exit:
+	free(empty_stats);
 	free(percpu_stats);
 	return err;
 }
@@ -1094,14 +1130,18 @@ static int report_aggregated_rtts(struct aggregation_maps *maps,
 				  struct aggregation_config *agg_conf)
 {
 	__u64 t = get_time_ns(CLOCK_MONOTONIC);
-	int err;
+	int err, map_idx;
 
-	err = report_aggregated_rtt_map(maps->map_v4_fd, AF_INET,
+	map_idx = switch_agg_map(maps->map_active_fd);
+	if (map_idx < 0)
+		return map_idx;
+
+	err = report_aggregated_rtt_map(maps->map_v4_fd[map_idx], AF_INET,
 					agg_conf->ipv4_prefix_len, t, agg_conf);
 	if (err)
 		return err;
 
-	err = report_aggregated_rtt_map(maps->map_v6_fd, AF_INET6,
+	err = report_aggregated_rtt_map(maps->map_v6_fd[map_idx], AF_INET6,
 					agg_conf->ipv6_prefix_len, t, agg_conf);
 	return err;
 }
@@ -1305,25 +1345,37 @@ destroy_ts_link:
 	return err;
 }
 
-int fetch_aggregation_map_fds(struct bpf_object *obj, struct aggregation_maps *maps)
+int fetch_aggregation_map_fds(struct bpf_object *obj,
+			      struct aggregation_maps *maps)
 {
 	char map_name[64];
-	int fd, ipv;
+	int fd, ipv, instance;
 	int *fd_dst;
 
+	fd = bpf_object__find_map_fd_by_name(obj, "map_active_agg_instance");
+	if (fd < 0) {
+		fprintf(stderr, "Unable to find aggregation idx map %s: %s\n",
+			"map_active_agg_instance", get_libbpf_strerror(fd));
+		return fd;
+	}
+	maps->map_active_fd = fd;
+
 	for (ipv = 4; ipv <= 6; ipv += 2) {
-		snprintf(map_name, sizeof(map_name), "map_v%d_agg", ipv);
+		for (instance = 0; instance < 2; instance++) {
+			snprintf(map_name, sizeof(map_name), "map_v%d_agg%d",
+				 ipv, instance + 1);
 
-		fd = bpf_object__find_map_fd_by_name(obj, map_name);
-		if (fd < 0) {
-			fprintf(stderr,
-				"Unable to find aggregation map %s: %s\n",
-				map_name, get_libbpf_strerror(fd));
-			return fd;
+			fd = bpf_object__find_map_fd_by_name(obj, map_name);
+			if (fd < 0) {
+				fprintf(stderr,
+					"Unable to find aggregation map %s: %s\n",
+					map_name, get_libbpf_strerror(fd));
+				return fd;
+			}
+
+			fd_dst = ipv == 4 ? maps->map_v4_fd : maps->map_v6_fd;
+			*(fd_dst + instance) = fd;
 		}
-
-		fd_dst = ipv == 4 ? &maps->map_v4_fd : &maps->map_v6_fd;
-		*fd_dst = fd;
 	}
 
 	return 0;
