@@ -1241,6 +1241,12 @@ exit:
 	return err;
 }
 
+static void set_timespec(struct timespec *ts, __u64 ns)
+{
+	ts->tv_sec = ns / NS_PER_SECOND;
+	ts->tv_nsec = ns % NS_PER_SECOND;
+}
+
 static int report_aggregated_rtts(struct aggregation_maps *maps,
 				  struct aggregation_config *agg_conf)
 {
@@ -1279,17 +1285,15 @@ static int report_aggregated_rtts(struct aggregation_maps *maps,
 static void *periodic_rtt_aggregation(void *args)
 {
 	struct aggregation_args *argp = args;
+	struct timespec interval;
 	char buf[256];
-
-	struct timespec interval = {
-		.tv_sec = argp->agg_conf->aggregation_interval / NS_PER_SECOND,
-		.tv_nsec = argp->agg_conf->aggregation_interval % NS_PER_SECOND,
-	};
+	__u64 t;
 
 	argp->err = 0;
 	while (keep_running) {
-		argp->err =
-			report_aggregated_rtts(&argp->maps, argp->agg_conf);
+		t = get_time_ns(CLOCK_MONOTONIC);
+
+		argp->err = report_aggregated_rtts(&argp->maps, argp->agg_conf);
 		if (argp->err) {
 			libbpf_strerror(argp->err, buf, sizeof(buf));
 			fprintf(stderr, "Failed fetching aggregated RTTs: %s\n",
@@ -1299,6 +1303,15 @@ static void *periodic_rtt_aggregation(void *args)
 			break;
 		}
 
+		t = get_time_ns(CLOCK_MONOTONIC) - t;
+#ifdef DEBUG
+		fprintf(stderr, "Time for reporting all entries: %.6g ms\n",
+			(double)t / NS_PER_MS);
+#endif
+		set_timespec(&interval,
+			     t < argp->agg_conf->aggregation_interval ?
+				     argp->agg_conf->aggregation_interval - t :
+				     0);
 		nanosleep(&interval, NULL);
 	}
 
