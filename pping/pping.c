@@ -77,6 +77,7 @@ struct aggregation_config {
 	__u64 bin_width;
 	__u8 ipv4_prefix_len;
 	__u8 ipv6_prefix_len;
+	enum PPING_OUTPUT_FORMAT format;
 };
 
 struct aggregation_maps {
@@ -382,6 +383,8 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.ipv6_prefix_mask =
 		htobe64(0xffffffffffffffffUL
 			<< (64 - config->agg_conf.ipv6_prefix_len));
+
+	config->agg_conf.format = config->output_format;
 
 	return 0;
 }
@@ -997,16 +1000,11 @@ static void handle_missed_events(void *ctx, int cpu, __u64 lost_cnt)
 	fprintf(stderr, "Lost %llu events on CPU %d\n", lost_cnt, cpu);
 }
 
-static void print_aggregated_rtts(FILE *stream, __u64 t, void *ip_prefix,
-				  int af, __u8 prefix_len,
-				  struct aggregated_rtt_stats *rtt_stats,
-				  struct aggregation_config *agg_conf)
+static void print_aggrtts_standard(FILE *stream, __u64 t, const char *prefixstr,
+				   struct aggregated_rtt_stats *rtt_stats,
+				   struct aggregation_config *agg_conf)
 {
 	int nb = agg_conf->n_bins, bw = agg_conf->bin_width;
-	char prefixstr[INET6_PREFIXSTRLEN] = "";
-
-	format_ipprefix(prefixstr, sizeof(prefixstr), af, ip_prefix,
-			prefix_len);
 
 	print_ns_datetime(stream, t);
 	fprintf(stream,
@@ -1018,6 +1016,51 @@ static void print_aggregated_rtts(FILE *stream, __u64 t, void *ip_prefix,
 		lhist_percentile(rtt_stats->bins, 95, nb, bw, 0) / NS_PER_MS,
 		(double)rtt_stats->max / NS_PER_MS);
 	fprintf(stream, "\n");
+}
+
+static void print_aggrtts_json(json_writer_t *ctx, __u64 t,
+			       const char *prefixstr,
+			       struct aggregated_rtt_stats *rtt_stats,
+			       struct aggregation_config *agg_conf)
+{
+	int nb = agg_conf->n_bins, bw = agg_conf->bin_width, i;
+
+	jsonw_start_object(ctx);
+	jsonw_u64_field(ctx, "timestamp", convert_monotonic_to_realtime(t));
+	jsonw_string_field(ctx, "ip_prefix", prefixstr);
+	jsonw_u64_field(ctx, "min_rtt", rtt_stats->min);
+	jsonw_float_field(ctx, "mean_rtt",
+			  lhist_mean(rtt_stats->bins, nb, bw, 0));
+	jsonw_float_field(ctx, "median_rtt",
+			  lhist_percentile(rtt_stats->bins, 50, nb, bw, 0));
+	jsonw_float_field(ctx, "p95_rtt",
+			  lhist_percentile(rtt_stats->bins, 95, nb, bw, 0));
+	jsonw_u64_field(ctx, "max_rtt", rtt_stats->max);
+	jsonw_u64_field(ctx, "bin_width", bw);
+
+	jsonw_name(ctx, "histogram");
+	jsonw_start_array(ctx);
+	for (i = 0; i < nb; i++)
+		jsonw_uint(ctx, rtt_stats->bins[i]);
+	jsonw_end_array(ctx);
+
+	jsonw_end_object(ctx);
+}
+
+static void print_aggregated_rtts(__u64 t, void *ip_prefix, int af,
+				  __u8 prefix_len,
+				  struct aggregated_rtt_stats *rtt_stats,
+				  struct aggregation_config *agg_conf)
+{
+	char prefixstr[INET6_PREFIXSTRLEN] = "";
+	format_ipprefix(prefixstr, sizeof(prefixstr), af, ip_prefix,
+			prefix_len);
+
+	if (agg_conf->format == PPING_OUTPUT_STANDARD)
+		print_aggrtts_standard(stdout, t, prefixstr, rtt_stats,
+				       agg_conf);
+	else
+		print_aggrtts_json(json_ctx, t, prefixstr, rtt_stats, agg_conf);
 }
 
 static bool aggregated_rtt_stats_empty(struct aggregated_rtt_stats *stats)
@@ -1100,8 +1143,8 @@ static int report_aggregated_rtt_map(int map_fd, int af, __u8 prefix_len,
 					    n_cpus, agg_conf->n_bins);
 		// Only print prefixes which have RTT samples
 		if (!aggregated_rtt_stats_empty(&merged_stats)) {
-			print_aggregated_rtts(stdout, t_monotonic, &next_key,
-					      af, prefix_len, &merged_stats,
+			print_aggregated_rtts(t_monotonic, &next_key, af,
+					      prefix_len, &merged_stats,
 					      agg_conf);
 
 			err = bpf_map_update_elem(map_fd, &next_key,
@@ -1466,10 +1509,16 @@ int main(int argc, char *argv[])
 	if (!config.bpf_config.track_tcp && !config.bpf_config.track_icmp)
 		config.bpf_config.track_tcp = true;
 
-	if (config.bpf_config.track_icmp &&
-	    config.output_format == PPING_OUTPUT_PPVIZ)
-		fprintf(stderr,
-			"Warning: ppviz format mainly intended for TCP traffic, but may now include ICMP traffic as well\n");
+	if (config.output_format == PPING_OUTPUT_PPVIZ) {
+		if (config.bpf_config.agg_rtts) {
+			fprintf(stderr,
+				"The ppviz format does not support aggregated output\n");
+			return EXIT_FAILURE;
+		}
+		if (config.bpf_config.track_icmp)
+			fprintf(stderr,
+				"Warning: ppviz format mainly intended for TCP traffic, but may now include ICMP traffic as well\n");
+	}
 
 	switch (config.output_format) {
 	case PPING_OUTPUT_STANDARD:
