@@ -44,6 +44,10 @@
 #define ICMP_FLOW_LIFETIME (30 * NS_PER_SECOND) // Clear any ICMP flows if they're inactive this long
 #define UNOPENED_FLOW_LIFETIME (30 * NS_PER_SECOND) // Clear out flows that have not seen a response after this long
 
+#define MAP_TIMESTAMP_SIZE 131072UL // 2^17, Maximum number of in-flight/unmatched timestamps we can keep track of
+#define MAP_FLOWSTATE_SIZE 131072UL // 2^17, Maximum number of concurrent flows that can be tracked
+#define MAP_AGGREGATION_SIZE 16384UL // 2^14, Maximum number of different IP-prefixes we can aggregate separate stats for
+
 #define MAX_MEMCMP_SIZE 128
 
 /*
@@ -133,14 +137,14 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct packet_id);
 	__type(value, __u64);
-	__uint(max_entries, 16384);
+	__uint(max_entries, MAP_TIMESTAMP_SIZE);
 } packet_ts SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct network_tuple);
 	__type(value, struct dual_flow_state);
-	__uint(max_entries, 16384);
+	__uint(max_entries, MAP_FLOWSTATE_SIZE);
 } flow_state SEC(".maps");
 
 struct {
@@ -153,7 +157,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u32);
 	__type(value, struct aggregated_rtt_stats);
-	__uint(max_entries, 16384);
+	__uint(max_entries, MAP_AGGREGATION_SIZE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } map_v4_agg1 SEC(".maps");
 
@@ -161,7 +165,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u32);
 	__type(value, struct aggregated_rtt_stats);
-	__uint(max_entries, 16384);
+	__uint(max_entries, MAP_AGGREGATION_SIZE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } map_v4_agg2 SEC(".maps");
 
@@ -169,7 +173,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u64);
 	__type(value, struct aggregated_rtt_stats);
-	__uint(max_entries, 16384);
+	__uint(max_entries, MAP_AGGREGATION_SIZE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } map_v6_agg1 SEC(".maps");
 
@@ -177,7 +181,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u64);
 	__type(value, struct aggregated_rtt_stats);
-	__uint(max_entries, 16384);
+	__uint(max_entries, MAP_AGGREGATION_SIZE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } map_v6_agg2 SEC(".maps");
 
