@@ -75,6 +75,9 @@ struct output_context {
 	char output_file[MAX_PATH_LEN];
 	FILE *stream;
 	json_writer_t *jctx;
+	__u64 rotate_period;
+	__u64 opened_at;
+	__u32 rotate_counter;
 	enum PPING_OUTPUT_FORMAT format;
 	bool write_to_file;
 };
@@ -135,6 +138,9 @@ struct pping_config {
 	bool created_tc_hook;
 };
 
+static int rotate_output(struct output_context *out_ctx, bool print_aggconf,
+			 struct aggregation_config *agg_conf);
+
 static volatile sig_atomic_t keep_running = 1;
 
 static const struct option long_options[] = {
@@ -159,6 +165,7 @@ static const struct option long_options[] = {
 	{ "aggregate-timeout",    required_argument, NULL, 'o' }, // Interval for timing out subnet entries in seconds (default 30s)
 	{ "truncate-histograms",  no_argument,       NULL, 'u' }, // Truncate trailing zeros from JSON histograms
 	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
+	{ "rotate-seconds",       required_argument, NULL, 'G' }, // Create a new output file every X seconds, with a number suffixed to the file name (similar to tcmpdump -G, but with file naming of tcpdump -C)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -235,7 +242,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:w:",
+	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:w:G:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -399,6 +406,15 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			strncpy(config->out_ctx.output_file, optarg,
 				sizeof(config->out_ctx.output_file));
 			config->out_ctx.write_to_file = true;
+			break;
+		case 'G':
+			err = parse_bounded_double(&user_val, optarg, 1e-9,
+						   7 * S_PER_DAY,
+						   "rotate-seconds");
+			if (err)
+				return err;
+			config->out_ctx.rotate_period =
+				user_val * NS_PER_SECOND;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -1389,14 +1405,19 @@ static void *periodic_rtt_aggregation(void *args)
 	while (keep_running) {
 		t = get_time_ns(CLOCK_MONOTONIC);
 
+		argp->err = rotate_output(argp->out_ctx, true, argp->agg_conf);
+		if (argp->err) {
+			libbpf_strerror(argp->err, buf, sizeof(buf));
+			fprintf(stderr, "Failed rotating output: %s\n", buf);
+			break;
+		}
+
 		argp->err = report_aggregated_rtts(argp->out_ctx, &argp->maps,
 						   argp->agg_conf);
 		if (argp->err) {
 			libbpf_strerror(argp->err, buf, sizeof(buf));
 			fprintf(stderr, "Failed fetching aggregated RTTs: %s\n",
 				buf);
-			fprintf(stderr, "Aborting program\n");
-			abort_program(SIGUSR1);
 			break;
 		}
 
@@ -1412,6 +1433,10 @@ static void *periodic_rtt_aggregation(void *args)
 		nanosleep(&interval, NULL);
 	}
 
+	if (argp->err) {
+		fprintf(stderr, "Aborting program\n");
+		abort_program(SIGUSR1);
+	}
 	pthread_exit(&argp->err);
 }
 
@@ -1664,13 +1689,25 @@ int setup_periodical_aggregate_rtts(struct bpf_object *obj,
 	return 0;
 }
 
+static void gen_filename(struct output_context *out_ctx, char *buf, size_t size)
+{
+	if (out_ctx->rotate_period == 0) {
+		strncpy(buf, out_ctx->output_file, size);
+	} else {
+		snprintf(buf, size, "%s%u", out_ctx->output_file,
+			 out_ctx->rotate_counter);
+	}
+}
+
 static int open_output(struct output_context *out_ctx, bool print_aggconf,
 		       struct aggregation_config *agg_conf)
 {
+	char filename[sizeof(out_ctx->output_file) + 32];
 	FILE *f;
 
 	if (out_ctx->write_to_file) {
-		f = fopen(out_ctx->output_file, "w");
+		gen_filename(out_ctx, filename, sizeof(filename));
+		f = fopen(filename, "w");
 		if (!f)
 			return -errno;
 
@@ -1678,6 +1715,8 @@ static int open_output(struct output_context *out_ctx, bool print_aggconf,
 	} else {
 		out_ctx->stream = stdout;
 	}
+
+	out_ctx->opened_at = get_time_ns(CLOCK_MONOTONIC);
 
 	if (out_ctx->format == PPING_OUTPUT_JSON) {
 		out_ctx->jctx = jsonw_new(out_ctx->stream);
@@ -1703,6 +1742,31 @@ static int close_output(struct output_context *out_ctx)
 	}
 
 	out_ctx->stream = NULL;
+
+	return 0;
+}
+
+static int rotate_output(struct output_context *out_ctx, bool print_aggconf,
+			 struct aggregation_config *agg_conf)
+{
+	__u64 t;
+	int err;
+
+	if (out_ctx->rotate_period == 0 || !out_ctx->write_to_file)
+		return 0;
+
+	t = get_time_ns(CLOCK_MONOTONIC);
+	if (t > out_ctx->opened_at &&
+	    t - out_ctx->opened_at > out_ctx->rotate_period) {
+		err = close_output(out_ctx);
+		if (err)
+			return err;
+
+		out_ctx->rotate_counter++;
+		err = open_output(out_ctx, print_aggconf, agg_conf);
+		if (err)
+			return err;
+	}
 
 	return 0;
 }
@@ -1837,12 +1901,22 @@ int main(int argc, char *argv[])
 
 	// Main loop
 	while (keep_running) {
-		if ((err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS)) < 0) {
-			if (keep_running) // Only print polling error if it wasn't caused by program termination
-				fprintf(stderr,
-					"Error polling perf buffer: %s\n",
-					get_libbpf_strerror(-err));
+		if (!config.bpf_config.agg_rtts) {
+			err = rotate_output(&config.out_ctx, false, NULL);
+			if (err) {
+				fprintf(stderr, "Failed rotating output: %s\n",
+					get_libbpf_strerror(err));
+				break;
+			}
+		}
+
+		err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS);
+		if (err < 0 && keep_running) {
+			fprintf(stderr, "Error polling perf buffer: %s\n",
+				get_libbpf_strerror(-err));
 			break;
+		} else {
+			err = 0;
 		}
 	}
 
