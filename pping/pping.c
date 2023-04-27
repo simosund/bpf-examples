@@ -78,6 +78,7 @@ struct output_context {
 	__u64 rotate_period;
 	__u64 opened_at;
 	__u32 rotate_counter;
+	__u32 rotate_wrap;
 	enum PPING_OUTPUT_FORMAT format;
 	bool write_to_file;
 };
@@ -166,6 +167,7 @@ static const struct option long_options[] = {
 	{ "truncate-histograms",  no_argument,       NULL, 'u' }, // Truncate trailing zeros from JSON histograms
 	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
 	{ "rotate-seconds",       required_argument, NULL, 'G' }, // Create a new output file every X seconds, with a number suffixed to the file name (similar to tcmpdump -G, but with file naming of tcpdump -C)
+	{ "wrap-rotation",        required_argument, NULL, 'W' }, // In conjunction with -G, set max files that can be created (will then start overwriting previous files, similar to tcpdump -W)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -242,7 +244,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:w:G:",
+	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:w:G:W:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -415,6 +417,13 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 				return err;
 			config->out_ctx.rotate_period =
 				user_val * NS_PER_SECOND;
+			break;
+		case 'W':
+			err = parse_bounded_double(&user_val, optarg, 1,
+						   1000000000, "wrap-rotation");
+			if (err)
+				return err;
+			config->out_ctx.rotate_wrap = user_val;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -1763,6 +1772,8 @@ static int rotate_output(struct output_context *out_ctx, bool print_aggconf,
 			return err;
 
 		out_ctx->rotate_counter++;
+		if (out_ctx->rotate_wrap)
+			out_ctx->rotate_counter %= out_ctx->rotate_wrap;
 		err = open_output(out_ctx, print_aggconf, agg_conf);
 		if (err)
 			return err;
