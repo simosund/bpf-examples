@@ -72,9 +72,11 @@ struct map_cleanup_args {
 };
 
 struct output_context {
+	char output_file[MAX_PATH_LEN];
 	FILE *stream;
 	json_writer_t *jctx;
 	enum PPING_OUTPUT_FORMAT format;
+	bool write_to_file;
 };
 
 struct aggregation_config {
@@ -156,6 +158,7 @@ static const struct option long_options[] = {
 	{ "aggregate-reverse",    no_argument,       NULL, 'e' }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
 	{ "aggregate-timeout",    required_argument, NULL, 'o' }, // Interval for timing out subnet entries in seconds (default 30s)
 	{ "truncate-histograms",  no_argument,       NULL, 'u' }, // Truncate trailing zeros from JSON histograms
+	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -232,7 +235,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:",
+	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:w:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -385,6 +388,17 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			break;
 		case 'u':
 			config->agg_conf.truncate_histograms = true;
+			break;
+		case 'w':
+			if (strlen(optarg) >
+			    sizeof(config->out_ctx.output_file) - 1) {
+				fprintf(stderr, "File name too long\n");
+				return -EINVAL;
+			}
+
+			strncpy(config->out_ctx.output_file, optarg,
+				sizeof(config->out_ctx.output_file));
+			config->out_ctx.write_to_file = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -1650,6 +1664,49 @@ int setup_periodical_aggregate_rtts(struct bpf_object *obj,
 	return 0;
 }
 
+static int open_output(struct output_context *out_ctx, bool print_aggconf,
+		       struct aggregation_config *agg_conf)
+{
+	FILE *f;
+
+	if (out_ctx->write_to_file) {
+		f = fopen(out_ctx->output_file, "w");
+		if (!f)
+			return -errno;
+
+		out_ctx->stream = f;
+	} else {
+		out_ctx->stream = stdout;
+	}
+
+	if (out_ctx->format == PPING_OUTPUT_JSON) {
+		out_ctx->jctx = jsonw_new(out_ctx->stream);
+		jsonw_start_array(out_ctx->jctx);
+	}
+
+	if (print_aggconf)
+		print_aggmetadata(out_ctx, agg_conf);
+
+	return 0;
+}
+
+static int close_output(struct output_context *out_ctx)
+{
+	if (out_ctx->format == PPING_OUTPUT_JSON && out_ctx->jctx) {
+		jsonw_end_array(out_ctx->jctx);
+		jsonw_destroy(&out_ctx->jctx);
+	}
+
+	if (out_ctx->write_to_file && out_ctx->stream) {
+		if (fclose(out_ctx->stream) != 0)
+			return -errno;
+	}
+
+	out_ctx->stream = NULL;
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	int err = 0, detach_err;
@@ -1665,7 +1722,7 @@ int main(int argc, char *argv[])
 				.rtt_rate = 0,
 				.use_srtt = false },
 		.out_ctx = { .format = PPING_OUTPUT_STANDARD,
-			     .stream = stdout,
+			     .stream = NULL,
 			     .jctx = NULL },
 		.clean_args = { .cleanup_interval = 1 * NS_PER_SECOND,
 				.valid_thread = false },
@@ -1741,13 +1798,13 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if (config.out_ctx.format == PPING_OUTPUT_JSON) {
-		config.out_ctx.jctx = jsonw_new(config.out_ctx.stream);
-		jsonw_start_array(config.out_ctx.jctx);
+	err = open_output(&config.out_ctx, config.bpf_config.agg_rtts,
+			  &config.agg_conf);
+	if (err) {
+		fprintf(stderr, "Unable to open %s: %s\n",
+			config.out_ctx.output_file, get_libbpf_strerror(err));
+		goto cleanup_attached_progs;
 	}
-
-	if (config.bpf_config.agg_rtts)
-		print_aggmetadata(&config.out_ctx, &config.agg_conf);
 
 	// Set up perf buffer
 	pb = perf_buffer__new(bpf_object__find_map_fd_by_name(obj,
@@ -1758,7 +1815,7 @@ int main(int argc, char *argv[])
 	if (err) {
 		fprintf(stderr, "Failed to open perf buffer %s: %s\n",
 			config.event_map, get_libbpf_strerror(err));
-		goto cleanup_attached_progs;
+		goto cleanup_close_output;
 	}
 
 	err = setup_periodical_map_cleaning(obj, &config);
@@ -1811,6 +1868,9 @@ cleanup_periodical_cleaning:
 cleanup_perf_buffer:
 	perf_buffer__free(pb);
 
+cleanup_close_output:
+	close_output(&config.out_ctx);
+
 cleanup_attached_progs:
 	if (config.xdp_prog)
 		detach_err = xdp_detach(config.xdp_prog, config.ifindex,
@@ -1830,11 +1890,6 @@ cleanup_attached_progs:
 		fprintf(stderr,
 			"Failed removing egress program from interface %s: %s\n",
 			config.ifname, get_libbpf_strerror(detach_err));
-
-	if (config.out_ctx.format == PPING_OUTPUT_JSON && config.out_ctx.jctx) {
-		jsonw_end_array(config.out_ctx.jctx);
-		jsonw_destroy(&config.out_ctx.jctx);
-	}
 
 	bpf_object__close(obj);
 
