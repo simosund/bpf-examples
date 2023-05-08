@@ -4217,6 +4217,9 @@ struct __sk_buff {
 	__u32 gso_segs;
 	__bpf_md_ptr(struct bpf_sock *, sk);
 	__u32 gso_size;
+	__u8  tstamp_type;
+	__u32 :24;		/* Padding, future use. */
+	__u64 hwtstamp;
 };
 
 struct bpf_tunnel_key {
