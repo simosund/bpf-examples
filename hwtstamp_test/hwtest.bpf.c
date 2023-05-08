@@ -5,7 +5,7 @@
 
 char _license[] SEC("license") = "GPL";
 
-SEC("classifier")
+SEC("tc")
 int hwtest_tc(struct __sk_buff *skb)
 {
 	bpf_printk("ktime_get_ns: %llu", bpf_ktime_get_ns());
