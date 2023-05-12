@@ -134,6 +134,7 @@ struct pping_config {
 	int ingress_prog_id;
 	int egress_prog_id;
 	char ifname[IF_NAMESIZE];
+	__u16 tc_priority;
 	enum xdp_attach_mode xdp_mode;
 	bool force;
 	bool created_tc_hook;
@@ -168,6 +169,7 @@ static const struct option long_options[] = {
 	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
 	{ "rotate-seconds",       required_argument, NULL, 'G' }, // Create a new output file every X seconds, with a number suffixed to the file name (similar to tcmpdump -G, but with file naming of tcpdump -C)
 	{ "wrap-rotation",        required_argument, NULL, 'W' }, // In conjunction with -G, set max files that can be created (will then start overwriting previous files, similar to tcpdump -W)
+	{ "tc-priority",          required_argument, NULL, 'p' }, // Set priority for tc program filter (default 0, let kernel decide)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -244,7 +246,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:w:G:W:",
+	while ((opt = getopt_long(argc, argv, "hflTCseui:r:R:t:c:F:I:x:a:4:6:o:w:G:W:p:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -425,6 +427,13 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 				return err;
 			config->out_ctx.rotate_wrap = user_val;
 			break;
+		case 'p':
+			err = parse_bounded_double(&user_val, optarg, 0,
+						   UINT16_MAX, "tc-priority");
+			if (err)
+				return err;
+			config->tc_priority = user_val;
+			break;
 		case 'h':
 			printf("HELP:\n");
 			print_usage(argv);
@@ -545,7 +554,7 @@ static int xdp_detach(struct xdp_program *prog, int ifindex,
  * On failure it will return a negative error code.
  */
 static int tc_attach(struct bpf_object *obj, int ifindex,
-		     enum bpf_tc_attach_point attach_point,
+		     enum bpf_tc_attach_point attach_point, __u16 priority,
 		     const char *prog_name, struct bpf_tc_opts *opts,
 		     bool *new_hook)
 {
@@ -570,6 +579,7 @@ static int tc_attach(struct bpf_object *obj, int ifindex,
 
 	opts->prog_fd = prog_fd;
 	opts->prog_id = 0;
+	opts->priority = priority;
 	err = bpf_tc_attach(&hook, opts);
 	if (err)
 		goto err_after_hook;
@@ -1519,7 +1529,8 @@ static int load_attach_bpfprogs(struct bpf_object **obj,
 			return err;
 		}
 		err = tc_attach(*obj, config->ifindex, BPF_TC_INGRESS,
-				config->ingress_prog, &config->tc_ingress_opts,
+				config->tc_priority, config->ingress_prog,
+				&config->tc_ingress_opts,
 				&config->created_tc_hook);
 		config->ingress_prog_id = err;
 	}
@@ -1532,8 +1543,8 @@ static int load_attach_bpfprogs(struct bpf_object **obj,
 
 	// Attach egress prog
 	config->egress_prog_id = tc_attach(
-		*obj, config->ifindex, BPF_TC_EGRESS, config->egress_prog,
-		&config->tc_egress_opts,
+		*obj, config->ifindex, BPF_TC_EGRESS, config->tc_priority,
+		config->egress_prog, &config->tc_egress_opts,
 		config->created_tc_hook ? NULL : &config->created_tc_hook);
 	if (config->egress_prog_id < 0) {
 		fprintf(stderr,
@@ -1818,6 +1829,7 @@ int main(int argc, char *argv[])
 		.event_map = "events",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
+		.tc_priority = 0,
 		.xdp_mode = XDP_MODE_NATIVE,
 	};
 
