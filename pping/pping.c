@@ -26,6 +26,7 @@ static const char *__doc__ =
 #include <sys/epoll.h>
 #include <linux/unistd.h>
 #include <linux/membarrier.h>
+#include <limits.h>
 
 #include "json_writer.h"
 #include "pping.h" //common structs for user-space and BPF parts
@@ -36,8 +37,6 @@ static const char *__doc__ =
 #define INET6_PREFIXSTRLEN (INET6_ADDRSTRLEN + 4)
 
 #define PERF_BUFFER_PAGES 64 // Related to the perf-buffer size?
-
-#define MAX_PATH_LEN 1024
 
 #define MON_TO_REAL_UPDATE_FREQ                                                \
 	(1 * NS_PER_SECOND) // Update offset between CLOCK_MONOTONIC and CLOCK_REALTIME once per second
@@ -89,9 +88,11 @@ struct map_cleanup_args {
 };
 
 struct output_context {
+	char output_file[PATH_MAX];
 	FILE *stream;
 	json_writer_t *jctx;
 	enum pping_output_format format;
+	bool write_to_file;
 };
 
 struct aggregation_config {
@@ -158,6 +159,7 @@ static const struct option long_options[] = {
 	{ "aggregate-subnets-v6", required_argument, NULL, '6' }, // Set the subnet size for IPv6 when aggregating (default 48)
 	{ "aggregate-reverse",    no_argument,       NULL, ARG_AGG_REVERSE }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
 	{ "aggregate-timeout",    required_argument, NULL, AGG_ARG_TIMEOUT }, // Interval for timing out subnet entries in seconds (default 30s)
+	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -252,7 +254,7 @@ static int parse_bounded_long(long long *res, const char *str, long long low,
 
 static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 {
-	int err, opt;
+	int err, opt, len;
 	double user_float;
 	long long user_int;
 
@@ -267,15 +269,17 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:4:6:",
+	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:4:6:w:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
-			if (strlen(optarg) > IF_NAMESIZE) {
+			len = strlen(optarg);
+			if (len >= IF_NAMESIZE) {
 				fprintf(stderr, "interface name too long\n");
 				return -EINVAL;
 			}
-			strncpy(config->ifname, optarg, IF_NAMESIZE);
+			memcpy(config->ifname, optarg, len);
+			config->ifname[len] = '\0';
 
 			config->ifindex = if_nametoindex(config->ifname);
 			if (config->ifindex == 0) {
@@ -415,6 +419,17 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 				return -EINVAL;
 			config->agg_conf.timeout_interval =
 				user_int * NS_PER_SECOND;
+			break;
+		case 'w':
+			len = strlen(optarg);
+			if (len >= sizeof(config->out_ctx.output_file)) {
+				fprintf(stderr, "File name too long\n");
+				return -ENAMETOOLONG;
+			}
+
+			memcpy(config->out_ctx.output_file, optarg, len);
+			config->out_ctx.output_file[len] = '\0';
+			config->out_ctx.write_to_file = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -1605,6 +1620,49 @@ destroy_ts_link:
 	return err;
 }
 
+static int open_output(struct output_context *out_ctx, bool print_aggconf,
+		       struct aggregation_config *agg_conf)
+{
+	FILE *f;
+
+	if (out_ctx->write_to_file) {
+		f = fopen(out_ctx->output_file, "ax");
+		if (!f)
+			return -errno;
+
+		out_ctx->stream = f;
+	} else {
+		out_ctx->stream = stdout;
+	}
+
+	if (out_ctx->format == PPING_OUTPUT_JSON) {
+		out_ctx->jctx = jsonw_new(out_ctx->stream);
+		jsonw_start_array(out_ctx->jctx);
+	}
+
+	if (print_aggconf)
+		print_aggmetadata(out_ctx, agg_conf);
+
+	return 0;
+}
+
+static int close_output(struct output_context *out_ctx)
+{
+	if (out_ctx->format == PPING_OUTPUT_JSON && out_ctx->jctx) {
+		jsonw_end_array(out_ctx->jctx);
+		jsonw_destroy(&out_ctx->jctx);
+	}
+
+	if (out_ctx->write_to_file && out_ctx->stream) {
+		if (fclose(out_ctx->stream) != 0)
+			return -errno;
+	}
+
+	out_ctx->stream = NULL;
+
+	return 0;
+}
+
 static int init_signalfd(void)
 {
 	sigset_t mask;
@@ -1969,7 +2027,7 @@ int main(int argc, char *argv[])
 				.rtt_rate = 0,
 				.use_srtt = false },
 		.out_ctx = { .format = PPING_OUTPUT_STANDARD,
-			     .stream = stdout,
+			     .stream = NULL,
 			     .jctx = NULL },
 		.clean_args = { .cleanup_interval = 1 * NS_PER_SECOND,
 				.valid_thread = false },
@@ -2032,13 +2090,13 @@ int main(int argc, char *argv[])
 		output_format_to_str(config.out_ctx.format),
 		tracked_protocols_to_str(&config), config.ifname);
 
-	if (config.out_ctx.format == PPING_OUTPUT_JSON) {
-		config.out_ctx.jctx = jsonw_new(config.out_ctx.stream);
-		jsonw_start_array(config.out_ctx.jctx);
+	err = open_output(&config.out_ctx, config.bpf_config.agg_rtts,
+			  &config.agg_conf);
+	if (err) {
+		fprintf(stderr, "Unable to open %s: %s\n",
+			config.out_ctx.output_file, get_libbpf_strerror(err));
+		return EXIT_FAILURE;
 	}
-
-	if (config.bpf_config.agg_rtts)
-		print_aggmetadata(&config.out_ctx, &config.agg_conf);
 
 	// Setup signalhandling (allow graceful shutdown on SIGINT/SIGTERM)
 	sigfd = init_signalfd();
@@ -2154,10 +2212,7 @@ cleanup_sigfd:
 	close(sigfd);
 
 cleanup_output:
-	if (config.out_ctx.format == PPING_OUTPUT_JSON && config.out_ctx.jctx) {
-		jsonw_end_array(config.out_ctx.jctx);
-		jsonw_destroy(&config.out_ctx.jctx);
-	}
+	close_output(&config.out_ctx);
 
 	return err != 0 || detach_err != 0;
 }
