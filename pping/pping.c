@@ -1426,7 +1426,6 @@ exit:
 	return err;
 }
 
-
 static int report_aggregated_rtts(struct output_context *out_ctx,
 				  struct aggregation_maps *maps,
 				  struct aggregation_config *agg_conf)
@@ -1663,6 +1662,28 @@ static int close_output(struct output_context *out_ctx)
 	return 0;
 }
 
+/* Will try to reopen the output.
+ * If it is able to open the new output it will replace the current output
+ * and close the old output. Otherwise, it will simply leave the current output
+ * as is. */
+static int reopen_output(struct output_context *out_ctx, bool print_aggconf,
+			 struct aggregation_config *agg_conf)
+{
+	struct output_context prev_out;
+	int err;
+
+	if (!out_ctx->write_to_file)
+		return 0;
+
+	memcpy(&prev_out, out_ctx, sizeof(*out_ctx));
+
+	err = open_output(out_ctx, print_aggconf, agg_conf);
+	if (err)
+		return err;
+
+	return close_output(&prev_out);
+}
+
 static int init_signalfd(void)
 {
 	sigset_t mask;
@@ -1671,6 +1692,7 @@ static int init_signalfd(void)
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTERM);
+	sigaddset(&mask, SIGHUP);
 
 	fd = signalfd(-1, &mask, 0);
 	if (fd < 0)
@@ -1683,7 +1705,9 @@ static int init_signalfd(void)
 	return fd;
 }
 
-static int handle_signalfd(int sigfd)
+static int handle_signalfd(int sigfd, struct output_context *out_ctx,
+			   bool print_aggconf,
+			   struct aggregation_config *agg_conf)
 {
 	struct signalfd_siginfo siginfo;
 	int ret;
@@ -1694,7 +1718,10 @@ static int handle_signalfd(int sigfd)
 		return -EBADFD;
 	}
 
-	if (siginfo.ssi_signo == SIGINT || siginfo.ssi_signo == SIGTERM) {
+	if (siginfo.ssi_signo == SIGHUP) {
+		reopen_output(out_ctx, print_aggconf, agg_conf);
+	} else if (siginfo.ssi_signo == SIGINT ||
+		   siginfo.ssi_signo == SIGTERM) {
 		abort_program();
 	} else {
 		fprintf(stderr, "Unexpected signal %d\n", siginfo.ssi_signo);
@@ -1991,8 +2018,10 @@ static int poll_events(int epfd, struct pping_config *config,
 			if (err)
 				goto err_abort;
 		} else if (events[i].data.u64 & EPOLL_EVENT_TYPE_SIGNAL) {
-			err = handle_signalfd(events[i].data.u64 &
-					      EPOLL_DATA_MASK);
+			err = handle_signalfd(
+				events[i].data.u64 & EPOLL_DATA_MASK,
+				&config->out_ctx, config->bpf_config.agg_rtts,
+				&config->agg_conf);
 			if (err)
 				goto err_abort;
 		} else {
@@ -2098,7 +2127,7 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	// Setup signalhandling (allow graceful shutdown on SIGINT/SIGTERM)
+	// Setup signalhandling (allow graceful shutdown on SIGINT/SIGTERM, reopen on SIGHUP)
 	sigfd = init_signalfd();
 	if (sigfd < 0) {
 		fprintf(stderr, "Failed creating signalfd: %s\n",
