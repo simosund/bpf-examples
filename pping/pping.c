@@ -56,6 +56,8 @@ static const char *__doc__ =
 
 #define ARG_AGG_REVERSE 256
 #define AGG_ARG_TIMEOUT 257
+#define ARG_AGG_BINWIDTH 258
+#define ARG_AGG_NBINS 259
 
 enum pping_output_format {
 	PPING_OUTPUT_STANDARD,
@@ -160,6 +162,8 @@ static const struct option long_options[] = {
 	{ "aggregate-reverse",    no_argument,       NULL, ARG_AGG_REVERSE }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
 	{ "aggregate-timeout",    required_argument, NULL, AGG_ARG_TIMEOUT }, // Interval for timing out subnet entries in seconds (default 30s)
 	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
+	{ "bin-width",            required_argument, NULL, ARG_AGG_BINWIDTH }, // The width of the bins in the aggregation histograms ms (default 1ms)
+	{ "number-bins",          required_argument, NULL, ARG_AGG_NBINS }, // The number of bins in the aggregation histogram (default 1000)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -431,6 +435,19 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			config->out_ctx.output_file[len] = '\0';
 			config->out_ctx.write_to_file = true;
 			break;
+		case ARG_AGG_BINWIDTH:
+			err = parse_bounded_long(&user_int, optarg, 1, 1000, "bin-width");
+			if (err)
+				return -EINVAL;
+			config->agg_conf.bin_width = user_int * NS_PER_MS;
+			break;
+		case ARG_AGG_NBINS:
+			err = parse_bounded_long(&user_int, optarg, 2, 8000,
+						 "number-bins");
+			if (err)
+				return -EINVAL;
+			config->agg_conf.n_bins = user_int;
+			break;
 		case 'h':
 			printf("HELP:\n");
 			print_usage(argv);
@@ -452,6 +469,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.ipv6_prefix_mask =
 		htobe64(0xffffffffffffffffUL
 			<< (64 - config->agg_conf.ipv6_prefix_len));
+
+	config->bpf_config.agg_bin_width = config->agg_conf.bin_width;
+	config->bpf_config.agg_n_bins = config->agg_conf.n_bins;
 
 	return 0;
 }
@@ -1123,40 +1143,40 @@ merge_percpu_aggreated_rtts(struct aggregated_rtt_stats *percpu_stats,
 			    struct aggregated_rtt_stats *merged_stats,
 			    int n_cpus, int n_bins)
 {
+	struct aggregated_rtt_stats *pcstats;
+	size_t vsize = sizeof_aggregated_rtt_stats(n_bins);
 	int i, bin;
 
 	memset(merged_stats, 0, sizeof(*merged_stats));
 
 	for (i = 0; i < n_cpus; i++) {
-		if (percpu_stats[i].last_updated > merged_stats->last_updated)
-			merged_stats->last_updated =
-				percpu_stats[i].last_updated;
+		pcstats = (void *)percpu_stats + i * vsize;
+		if (pcstats->last_updated > merged_stats->last_updated)
+			merged_stats->last_updated = pcstats->last_updated;
 
-		merged_stats->rx_packet_count +=
-			percpu_stats[i].rx_packet_count;
-		merged_stats->tx_packet_count +=
-			percpu_stats[i].tx_packet_count;
-		merged_stats->rx_byte_count += percpu_stats[i].rx_byte_count;
-		merged_stats->tx_byte_count += percpu_stats[i].tx_byte_count;
+		merged_stats->rx_packet_count += pcstats->rx_packet_count;
+		merged_stats->tx_packet_count += pcstats->tx_packet_count;
+		merged_stats->rx_byte_count += pcstats->rx_byte_count;
+		merged_stats->tx_byte_count += pcstats->tx_byte_count;
 
 		if (aggregated_rtt_stats_nortts(&percpu_stats[i]))
 			continue;
 
-		if (percpu_stats[i].max > merged_stats->max)
-			merged_stats->max = percpu_stats[i].max;
-		if (merged_stats->min == 0 ||
-		    percpu_stats[i].min < merged_stats->min)
-			merged_stats->min = percpu_stats[i].min;
+		if (pcstats->max > merged_stats->max)
+			merged_stats->max = pcstats->max;
+		if (merged_stats->min == 0 || pcstats->min < merged_stats->min)
+			merged_stats->min = pcstats->min;
 
 		for (bin = 0; bin < n_bins; bin++)
-			merged_stats->bins[bin] += percpu_stats[i].bins[bin];
+			merged_stats->bins[bin] += pcstats->bins[bin];
 	}
 }
 
-static void clear_aggregated_rtts(struct aggregated_rtt_stats *stats)
+static void clear_aggregated_rtts(struct aggregated_rtt_stats *stats,
+				  int n_bins)
 {
 	__u64 last_updated = stats->last_updated;
-	memset(stats, 0, sizeof(*stats));
+	memset(stats, 0, sizeof_aggregated_rtt_stats(n_bins));
 	stats->last_updated = last_updated;
 }
 
@@ -1326,12 +1346,14 @@ static int switch_agg_map(int map_active_fd)
 
 static void report_aggregated_rtt_mapentry(
 	struct output_context *out_ctx, struct ipprefix_key *prefix,
-	struct aggregated_rtt_stats *percpu_stats, int n_cpus, int af,
+	struct aggregated_rtt_stats *percpu_stats,
+	struct aggregated_rtt_stats *merged_buf, int n_cpus, int af,
 	__u8 prefix_len, __u64 t_monotonic, struct aggregation_config *agg_conf,
 	bool *del_entry)
 {
-	struct aggregated_rtt_stats merged_stats;
+	//struct aggregated_rtt_stats merged_stats;
 	struct ipprefix_key backup_key = { 0 };
+	size_t vsize = sizeof_aggregated_rtt_stats(agg_conf->n_bins);
 	int i;
 
 	// Report the backup keys as 0.0.0.0/0 or ::/0
@@ -1341,27 +1363,28 @@ static void report_aggregated_rtt_mapentry(
 		prefix_len = 0;
 	}
 
-	merge_percpu_aggreated_rtts(percpu_stats, &merged_stats, n_cpus,
+	merge_percpu_aggreated_rtts(percpu_stats, merged_buf, n_cpus,
 				    agg_conf->n_bins);
 
 	if (prefix_len > 0 && // Pointless deleting /0 entry, and ensures backup keys are never deleted
 	    agg_conf->timeout_interval > 0 &&
-	    merged_stats.last_updated < t_monotonic &&
-	    t_monotonic - merged_stats.last_updated >
-		    agg_conf->timeout_interval)
+	    merged_buf->last_updated < t_monotonic &&
+	    t_monotonic - merged_buf->last_updated > agg_conf->timeout_interval)
 		*del_entry = true;
 	else
 		*del_entry = false;
 
 	// Only print and clear prefixes which have RTT samples
-	if (!aggregated_rtt_stats_empty(&merged_stats)) {
+	if (!aggregated_rtt_stats_empty(merged_buf)) {
 		print_aggregated_rtts(out_ctx, t_monotonic, prefix, af,
-				      prefix_len, &merged_stats, agg_conf);
+				      prefix_len, merged_buf, agg_conf);
 
 		// Clear out the reported stats
 		if (!*del_entry)
 			for (i = 0; i < n_cpus; i++) {
-				clear_aggregated_rtts(&percpu_stats[i]);
+				clear_aggregated_rtts((void *)percpu_stats +
+							      i * vsize,
+						      agg_conf->n_bins);
 			}
 	}
 }
@@ -1370,9 +1393,10 @@ static int report_aggregated_rtt_map(struct output_context *out_ctx, int map_fd,
 				     int af, __u8 prefix_len, __u64 t_monotonic,
 				     struct aggregation_config *agg_conf)
 {
-	struct aggregated_rtt_stats *values = NULL;
+	struct aggregated_rtt_stats *values = NULL, *merged_buf = NULL;
 	void *keys = NULL, *del_keys = NULL;
 	int n_cpus = libbpf_num_possible_cpus();
+	size_t valuesize = sizeof_aggregated_rtt_stats(agg_conf->n_bins);
 	size_t keysize = af == AF_INET ? sizeof(__u32) : sizeof(__u64);
 	__u32 count = AGG_BATCH_SIZE, total = 0, del_idx = 0;
 	__u64 batch;
@@ -1381,10 +1405,11 @@ static int report_aggregated_rtt_map(struct output_context *out_ctx, int map_fd,
 
 	DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, batch_opts, .flags = BPF_EXIST);
 
-	values = calloc(n_cpus, sizeof(*values) * AGG_BATCH_SIZE);
+	values = calloc(n_cpus, valuesize * AGG_BATCH_SIZE);
+	merged_buf = calloc(1, valuesize);
 	keys = calloc(AGG_BATCH_SIZE, keysize);
 	del_keys = calloc(MAP_AGGREGATION_SIZE, keysize);
-	if (!values || !keys || !del_keys) {
+	if (!values || !merged_buf || !keys || !del_keys) {
 		err = -ENOMEM;
 		goto exit;
 	}
@@ -1400,8 +1425,9 @@ static int report_aggregated_rtt_map(struct output_context *out_ctx, int map_fd,
 		for (i = 0; i < count; i++) {
 			report_aggregated_rtt_mapentry(
 				out_ctx, keys + i * keysize,
-				values + i * n_cpus, n_cpus, af, prefix_len,
-				t_monotonic, agg_conf, &del_key);
+				(void *)values + i * valuesize * n_cpus,
+				merged_buf, n_cpus, af, prefix_len, t_monotonic,
+				agg_conf, &del_key);
 
 			if (del_key)
 				memcpy(del_keys + del_idx++ * keysize,
@@ -1421,6 +1447,7 @@ static int report_aggregated_rtt_map(struct output_context *out_ctx, int map_fd,
 
 exit:
 	free(values);
+	free(merged_buf);
 	free(keys);
 	free(del_keys);
 	return err;
@@ -1447,6 +1474,29 @@ static int report_aggregated_rtts(struct output_context *out_ctx,
 					AF_INET6, agg_conf->ipv6_prefix_len, t,
 					agg_conf);
 	return err;
+}
+
+int init_aggregation_map_size(struct bpf_object *obj, __u32 n_bins)
+{
+	struct bpf_map *map;
+	int err;
+
+	bpf_object__for_each_map(map, obj)
+	{
+		if (strstr(bpf_map__name(map), "map_v") &&
+		    strstr(bpf_map__name(map), "_agg")) {
+			fprintf(stderr, "map %s before: %d\n",
+				bpf_map__name(map), bpf_map__value_size(map));
+			err = bpf_map__set_value_size(
+				map, sizeof_aggregated_rtt_stats(n_bins));
+			if (err)
+				return err;
+			fprintf(stderr, "map %s after: %d\n\n",
+				bpf_map__name(map), bpf_map__value_size(map));
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -1492,6 +1542,12 @@ static int load_attach_bpfprogs(struct bpf_object **obj,
 		fprintf(stderr, "Failed pushing user-configration to %s: %s\n",
 			config->object_path, get_libbpf_strerror(err));
 		return err;
+	}
+
+	if (config->bpf_config.agg_rtts) {
+		err = init_aggregation_map_size(*obj, config->agg_conf.n_bins);
+		if (err)
+			return err;
 	}
 
 	set_programs_to_load(*obj, config);
@@ -1788,14 +1844,15 @@ int fetch_aggregation_map_fds(struct bpf_object *obj,
 	return 0;
 }
 
-static int init_agg_backup_entries(struct aggregation_maps *maps, bool ipv4,
-				   bool ipv6)
+static int init_agg_backup_entries(struct aggregation_maps *maps, int n_bins,
+				   bool ipv4, bool ipv6)
 {
 	struct aggregated_rtt_stats *empty_stats;
 	struct ipprefix_key key;
 	int instance, err = 0;
 
-	empty_stats = calloc(libbpf_num_possible_cpus(), sizeof(*empty_stats));
+	empty_stats = calloc(libbpf_num_possible_cpus(),
+			     sizeof_aggregated_rtt_stats(n_bins));
 	if (!empty_stats)
 		return -errno;
 
@@ -1866,6 +1923,7 @@ static int init_aggregation_timer(struct bpf_object *obj,
 	}
 
 	err = init_agg_backup_entries(&config->agg_maps,
+				      config->agg_conf.n_bins,
 				      config->agg_conf.ipv4_prefix_len > 0,
 				      config->agg_conf.ipv6_prefix_len > 0);
 	if (err) {
@@ -2054,7 +2112,9 @@ int main(int argc, char *argv[])
 	struct pping_config config = {
 		.bpf_config = { .rate_limit = 100 * NS_PER_MS,
 				.rtt_rate = 0,
-				.use_srtt = false },
+				.use_srtt = false,
+				.agg_n_bins = RTT_AGG_NR_BINS,
+				.agg_bin_width = RTT_AGG_BIN_WIDTH },
 		.out_ctx = { .format = PPING_OUTPUT_STANDARD,
 			     .stream = NULL,
 			     .jctx = NULL },

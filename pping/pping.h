@@ -84,6 +84,8 @@ enum __attribute__((__packed__)) connection_state {
 struct bpf_config {
 	__u64 rate_limit;
 	fixpoint64 rtt_rate;
+	__u64 agg_bin_width;
+	__u64 agg_n_bins;
 	__u64 ipv6_prefix_mask;
 	__u32 ipv4_prefix_mask;
 	bool use_srtt;
@@ -253,7 +255,10 @@ struct aggregated_rtt_stats {
 	__u64 tx_byte_count;
 	__u64 min;
 	__u64 max;
-	__u32 bins[RTT_AGG_NR_BINS];
+	__u32 bins[];
 };
+
+#define sizeof_aggregated_rtt_stats(N_BINS)                                    \
+	(sizeof(struct aggregated_rtt_stats) + sizeof(__u32) * N_BINS)
 
 #endif

@@ -130,8 +130,10 @@ static volatile __u64 last_warn_time[2] = { 0 };
 // Keep an empty aggregated_rtt_stats as a global variable to use as a template
 // when creating new entries. That way, it won't have to be allocated on stack
 // (where it won't fit anyways) and initialized each time during run time.
-static struct aggregated_rtt_stats empty_stats = { 0 };
-
+static struct {
+	struct aggregated_rtt_stats stats;
+	__u32 bins[8000];
+} empty_stats = { 0 };
 
 // Map definitions
 struct {
@@ -1043,8 +1045,9 @@ static void aggregate_rtt(__u64 rtt, struct aggregated_rtt_stats *agg_stats)
 	if (rtt > agg_stats->max)
 		agg_stats->max = rtt;
 
-	bin_idx = rtt / RTT_AGG_BIN_WIDTH;
-	bin_idx = bin_idx >= RTT_AGG_NR_BINS ? RTT_AGG_NR_BINS - 1 : bin_idx;
+	bin_idx = rtt / config.agg_bin_width;
+	bin_idx =
+		bin_idx >= config.agg_n_bins ? config.agg_n_bins - 1 : bin_idx;
 	agg_stats->bins[bin_idx]++;
 }
 
