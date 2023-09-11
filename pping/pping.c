@@ -1119,59 +1119,96 @@ static void handle_missed_events(void *ctx, int cpu, __u64 lost_cnt)
 	fprintf(stderr, "Lost %llu events on CPU %d\n", lost_cnt, cpu);
 }
 
-static bool aggregated_rtt_stats_empty(struct aggregated_rtt_stats *stats)
+static __u64 sum_agg_pktcnts_pkts(struct aggregated_stats *stats, bool dir_tx)
 {
-	return stats->tx_packet_count == 0 && stats->rx_packet_count == 0;
+	__u64 sum = 0;
+	int grp;
+
+	for (grp = 0; grp < AGG_PKTCNT_N_GROUPS; grp++)
+		sum += stats->pkt_cnt[grp][dir_tx ? TX_IDX : RX_IDX]
+			       .packet_count;
+
+	return sum;
 }
 
-static bool aggregated_rtt_stats_nortts(struct aggregated_rtt_stats *stats)
+static __u64 sum_agg_pktcnts_bytes(struct aggregated_stats *stats, bool dir_tx)
 {
-	return stats->max == 0;
+	__u64 sum = 0;
+	int grp;
+
+	for (grp = 0; grp < AGG_PKTCNT_N_GROUPS; grp++)
+		sum += stats->pkt_cnt[grp][dir_tx ? TX_IDX : RX_IDX].byte_count;
+
+	return sum;
 }
 
-static __u64 aggregated_rtt_stats_maxbins(struct aggregated_rtt_stats *stats,
-					  __u64 bin_width, __u64 n_bins)
+static bool aggregated_stats_empty(struct aggregated_stats *stats)
 {
-	return stats->max / bin_width < n_bins ? stats->max / bin_width + 1 :
-						 n_bins;
+	return sum_agg_pktcnts_pkts(stats, true) +
+		       sum_agg_pktcnts_pkts(stats, false) ==
+	       0;
 }
 
-static void
-merge_percpu_aggreated_rtts(struct aggregated_rtt_stats *percpu_stats,
-			    struct aggregated_rtt_stats *merged_stats,
-			    int n_cpus, int n_bins)
+static bool aggregated_stats_nortts(struct aggregated_stats *stats)
 {
-	int i, bin;
+	return stats->rtt_max == 0;
+}
+
+static __u64 aggregated_stats_maxbins(struct aggregated_stats *stats,
+				      __u64 bin_width, __u64 n_bins)
+{
+	return stats->rtt_max / bin_width < n_bins ?
+		       stats->rtt_max / bin_width + 1 :
+		       n_bins;
+}
+
+static void add_packetcounters(struct packet_counters *to,
+			       const struct packet_counters *from)
+{
+	to->packet_count += from->packet_count;
+	to->byte_count += from->byte_count;
+}
+
+static void update_aggregated_stats(struct aggregated_stats *to_stats,
+				    struct aggregated_stats *from_stats,
+				    int n_bins)
+{
+	int grp, dir, bin;
+
+	if (from_stats->last_updated > to_stats->last_updated)
+		to_stats->last_updated = from_stats->last_updated;
+
+	for (grp = 0; grp < AGG_PKTCNT_N_GROUPS; grp++) {
+		for (dir = 0; dir < 2; dir++)
+			add_packetcounters(&to_stats->pkt_cnt[grp][dir],
+					   &from_stats->pkt_cnt[grp][dir]);
+	}
+
+	if (aggregated_stats_nortts(from_stats))
+		return;
+
+	if (from_stats->rtt_max > to_stats->rtt_max)
+		to_stats->rtt_max = from_stats->rtt_max;
+	if (to_stats->rtt_min == 0 || from_stats->rtt_min < to_stats->rtt_min)
+		to_stats->rtt_min = from_stats->rtt_min;
+
+	for (bin = 0; bin < n_bins; bin++)
+		to_stats->rtt_bins[bin] += from_stats->rtt_bins[bin];
+}
+
+static void merge_percpu_aggreated_stats(struct aggregated_stats *percpu_stats,
+					 struct aggregated_stats *merged_stats,
+					 int n_cpus, int n_bins)
+{
+	int i;
 
 	memset(merged_stats, 0, sizeof(*merged_stats));
 
-	for (i = 0; i < n_cpus; i++) {
-		if (percpu_stats[i].last_updated > merged_stats->last_updated)
-			merged_stats->last_updated =
-				percpu_stats[i].last_updated;
-
-		merged_stats->rx_packet_count +=
-			percpu_stats[i].rx_packet_count;
-		merged_stats->tx_packet_count +=
-			percpu_stats[i].tx_packet_count;
-		merged_stats->rx_byte_count += percpu_stats[i].rx_byte_count;
-		merged_stats->tx_byte_count += percpu_stats[i].tx_byte_count;
-
-		if (aggregated_rtt_stats_nortts(&percpu_stats[i]))
-			continue;
-
-		if (percpu_stats[i].max > merged_stats->max)
-			merged_stats->max = percpu_stats[i].max;
-		if (merged_stats->min == 0 ||
-		    percpu_stats[i].min < merged_stats->min)
-			merged_stats->min = percpu_stats[i].min;
-
-		for (bin = 0; bin < n_bins; bin++)
-			merged_stats->bins[bin] += percpu_stats[i].bins[bin];
-	}
+	for (i = 0; i < n_cpus; i++)
+		update_aggregated_stats(merged_stats, &percpu_stats[i], n_bins);
 }
 
-static void clear_aggregated_rtts(struct aggregated_rtt_stats *stats)
+static void clear_aggregated_stats(struct aggregated_stats *stats)
 {
 	__u64 last_updated = stats->last_updated;
 	memset(stats, 0, sizeof(*stats));
@@ -1216,81 +1253,116 @@ static void print_aggmetadata(struct output_context *out_ctx,
 		print_aggmetadata_json(out_ctx->jctx, agg_conf);
 }
 
-static void print_aggrtts_standard(FILE *stream, __u64 t, const char *prefixstr,
-				   struct aggregated_rtt_stats *rtt_stats,
-				   struct aggregation_config *agg_conf)
+static void print_aggstats_standard(FILE *stream, __u64 t,
+				    const char *prefixstr,
+				    struct aggregated_stats *rtt_stats,
+				    struct aggregation_config *agg_conf)
 {
 	__u64 bw = agg_conf->bin_width;
-	__u64 nb = aggregated_rtt_stats_maxbins(rtt_stats, bw, agg_conf->n_bins);
+	__u64 nb = aggregated_stats_maxbins(rtt_stats, bw, agg_conf->n_bins);
 
 	print_ns_datetime(stream, t);
 	fprintf(stream,
 		": %s -> rxpkts=%llu, rxbytes=%llu, txpkts=%llu, txbytes=%llu",
-		prefixstr, rtt_stats->rx_packet_count, rtt_stats->rx_byte_count,
-		rtt_stats->tx_packet_count, rtt_stats->tx_byte_count);
+		prefixstr, sum_agg_pktcnts_pkts(rtt_stats, false),
+		sum_agg_pktcnts_bytes(rtt_stats, false),
+		sum_agg_pktcnts_pkts(rtt_stats, true),
+		sum_agg_pktcnts_bytes(rtt_stats, true));
 
-	if (aggregated_rtt_stats_nortts(rtt_stats))
+	if (aggregated_stats_nortts(rtt_stats))
 		goto exit;
 
 	fprintf(stream,
 		", rtt-count=%llu, min=%.6g ms, mean=%g ms, median=%g ms, p95=%g ms, max=%.6g ms",
-		lhist_count(rtt_stats->bins, nb),
-		(double)rtt_stats->min / NS_PER_MS,
-		lhist_mean(rtt_stats->bins, nb, bw, 0) / NS_PER_MS,
-		lhist_percentile(rtt_stats->bins, 50, nb, bw, 0) / NS_PER_MS,
-		lhist_percentile(rtt_stats->bins, 95, nb, bw, 0) / NS_PER_MS,
-		(double)rtt_stats->max / NS_PER_MS);
+		lhist_count(rtt_stats->rtt_bins, nb),
+		(double)rtt_stats->rtt_min / NS_PER_MS,
+		lhist_mean(rtt_stats->rtt_bins, nb, bw, 0) / NS_PER_MS,
+		lhist_percentile(rtt_stats->rtt_bins, 50, nb, bw, 0) /
+			NS_PER_MS,
+		lhist_percentile(rtt_stats->rtt_bins, 95, nb, bw, 0) /
+			NS_PER_MS,
+		(double)rtt_stats->rtt_max / NS_PER_MS);
 
 exit:
 	fprintf(stream, "\n");
 }
 
-static void print_aggrtts_json(json_writer_t *ctx, __u64 t,
-			       const char *prefixstr,
-			       struct aggregated_rtt_stats *rtt_stats,
-			       struct aggregation_config *agg_conf)
+static char *agg_pktcntgroup_to_str(enum agg_pktcnt_group group)
+{
+	switch (group) {
+	case AGG_PKTCNT_TCPTS:
+		return "TCP_TS";
+	case AGG_PKTCNT_TCPNOTS:
+		return "TCP_no_TS";
+	case AGG_PKTCNT_OTHER:
+		return "not_TCP";
+	default:
+		return "unknown";
+	}
+}
+
+static void print_agg_pktcnt_group_json(json_writer_t *ctx, const char *grpname,
+					struct packet_counters counters[2])
+{
+	jsonw_name(ctx, grpname);
+	jsonw_start_object(ctx);
+
+	jsonw_u64_field(ctx, "tx_packets", counters[TX_IDX].packet_count);
+	jsonw_u64_field(ctx, "tx_bytes", counters[TX_IDX].byte_count);
+	jsonw_u64_field(ctx, "rx_packets", counters[RX_IDX].packet_count);
+	jsonw_u64_field(ctx, "rx_bytes", counters[RX_IDX].byte_count);
+
+	jsonw_end_object(ctx);
+}
+
+static void print_aggstats_json(json_writer_t *ctx, __u64 t,
+				const char *prefixstr,
+				struct aggregated_stats *rtt_stats,
+				struct aggregation_config *agg_conf)
 {
 	__u64 bw = agg_conf->bin_width;
-	__u64 nb = aggregated_rtt_stats_maxbins(rtt_stats, bw, agg_conf->n_bins);
-	int i;
+	__u64 nb = aggregated_stats_maxbins(rtt_stats, bw, agg_conf->n_bins);
+	int i, grp;
 
 	jsonw_start_object(ctx);
 	jsonw_u64_field(ctx, "timestamp", convert_monotonic_to_realtime(t));
 	jsonw_string_field(ctx, "ip_prefix", prefixstr);
 
-	jsonw_u64_field(ctx, "rx_packets", rtt_stats->rx_packet_count);
-	jsonw_u64_field(ctx, "tx_packets", rtt_stats->tx_packet_count);
-	jsonw_u64_field(ctx, "rx_bytes", rtt_stats->rx_byte_count);
-	jsonw_u64_field(ctx, "tx_bytes", rtt_stats->tx_byte_count);
+	jsonw_name(ctx, "packet_counts");
+	jsonw_start_object(ctx);
+	for (grp = 0; grp < AGG_PKTCNT_N_GROUPS; grp++)
+		print_agg_pktcnt_group_json(ctx, agg_pktcntgroup_to_str(grp),
+					    rtt_stats->pkt_cnt[grp]);
+	jsonw_end_object(ctx);
 
-	if (aggregated_rtt_stats_nortts(rtt_stats))
+	if (aggregated_stats_nortts(rtt_stats))
 		goto exit;
 
-	jsonw_u64_field(ctx, "count_rtt", lhist_count(rtt_stats->bins, nb));
-	jsonw_u64_field(ctx, "min_rtt", rtt_stats->min);
+	jsonw_u64_field(ctx, "count_rtt", lhist_count(rtt_stats->rtt_bins, nb));
+	jsonw_u64_field(ctx, "min_rtt", rtt_stats->rtt_min);
 	jsonw_float_field(ctx, "mean_rtt",
-			  lhist_mean(rtt_stats->bins, nb, bw, 0));
+			  lhist_mean(rtt_stats->rtt_bins, nb, bw, 0));
 	jsonw_float_field(ctx, "median_rtt",
-			  lhist_percentile(rtt_stats->bins, 50, nb, bw, 0));
+			  lhist_percentile(rtt_stats->rtt_bins, 50, nb, bw, 0));
 	jsonw_float_field(ctx, "p95_rtt",
-			  lhist_percentile(rtt_stats->bins, 95, nb, bw, 0));
-	jsonw_u64_field(ctx, "max_rtt", rtt_stats->max);
+			  lhist_percentile(rtt_stats->rtt_bins, 95, nb, bw, 0));
+	jsonw_u64_field(ctx, "max_rtt", rtt_stats->rtt_max);
 
 	jsonw_name(ctx, "histogram");
 	jsonw_start_array(ctx);
 	for (i = 0; i < nb; i++)
-		jsonw_uint(ctx, rtt_stats->bins[i]);
+		jsonw_uint(ctx, rtt_stats->rtt_bins[i]);
 	jsonw_end_array(ctx);
 
 exit:
 	jsonw_end_object(ctx);
 }
 
-static void print_aggregated_rtts(struct output_context *out_ctx, __u64 t,
-				  struct ipprefix_key *prefix, int af,
-				  __u8 prefix_len,
-				  struct aggregated_rtt_stats *rtt_stats,
-				  struct aggregation_config *agg_conf)
+static void print_aggregated_stats(struct output_context *out_ctx, __u64 t,
+				   struct ipprefix_key *prefix, int af,
+				   __u8 prefix_len,
+				   struct aggregated_stats *rtt_stats,
+				   struct aggregation_config *agg_conf)
 {
 	char prefixstr[INET6_PREFIXSTRLEN] = { 0 };
 
@@ -1300,11 +1372,11 @@ static void print_aggregated_rtts(struct output_context *out_ctx, __u64 t,
 	format_ipprefix(prefixstr, sizeof(prefixstr), af, prefix, prefix_len);
 
 	if (out_ctx->format == PPING_OUTPUT_STANDARD)
-		print_aggrtts_standard(out_ctx->stream, t, prefixstr, rtt_stats,
-				       agg_conf);
+		print_aggstats_standard(out_ctx->stream, t, prefixstr,
+					rtt_stats, agg_conf);
 	else if (out_ctx->jctx)
-		print_aggrtts_json(out_ctx->jctx, t, prefixstr, rtt_stats,
-				   agg_conf);
+		print_aggstats_json(out_ctx->jctx, t, prefixstr, rtt_stats,
+				    agg_conf);
 }
 
 // Stolen from BPF selftests
@@ -1342,13 +1414,13 @@ static int switch_agg_map(int map_active_fd)
 	return prev_map;
 }
 
-static void report_aggregated_rtt_mapentry(
+static void report_aggregated_stats_mapentry(
 	struct output_context *out_ctx, struct ipprefix_key *prefix,
-	struct aggregated_rtt_stats *percpu_stats, int n_cpus, int af,
+	struct aggregated_stats *percpu_stats, int n_cpus, int af,
 	__u8 prefix_len, __u64 t_monotonic, struct aggregation_config *agg_conf,
 	bool *del_entry)
 {
-	struct aggregated_rtt_stats merged_stats;
+	struct aggregated_stats merged_stats;
 	struct ipprefix_key backup_key = { 0 };
 	int i;
 
@@ -1359,8 +1431,8 @@ static void report_aggregated_rtt_mapentry(
 		prefix_len = 0;
 	}
 
-	merge_percpu_aggreated_rtts(percpu_stats, &merged_stats, n_cpus,
-				    agg_conf->n_bins);
+	merge_percpu_aggreated_stats(percpu_stats, &merged_stats, n_cpus,
+				     agg_conf->n_bins);
 
 	if (prefix_len > 0 && // Pointless deleting /0 entry, and ensures backup keys are never deleted
 	    agg_conf->timeout_interval > 0 &&
@@ -1371,24 +1443,25 @@ static void report_aggregated_rtt_mapentry(
 	else
 		*del_entry = false;
 
-	// Only print and clear prefixes which have RTT samples
-	if (!aggregated_rtt_stats_empty(&merged_stats)) {
-		print_aggregated_rtts(out_ctx, t_monotonic, prefix, af,
-				      prefix_len, &merged_stats, agg_conf);
+	// Only print and clear prefixes which have seen traffic
+	if (!aggregated_stats_empty(&merged_stats)) {
+		print_aggregated_stats(out_ctx, t_monotonic, prefix, af,
+				       prefix_len, &merged_stats, agg_conf);
 
 		// Clear out the reported stats
 		if (!*del_entry)
 			for (i = 0; i < n_cpus; i++) {
-				clear_aggregated_rtts(&percpu_stats[i]);
+				clear_aggregated_stats(&percpu_stats[i]);
 			}
 	}
 }
 
-static int report_aggregated_rtt_map(struct output_context *out_ctx, int map_fd,
-				     int af, __u8 prefix_len, __u64 t_monotonic,
-				     struct aggregation_config *agg_conf)
+static int report_aggregated_stats_map(struct output_context *out_ctx,
+				       int map_fd, int af, __u8 prefix_len,
+				       __u64 t_monotonic,
+				       struct aggregation_config *agg_conf)
 {
-	struct aggregated_rtt_stats *values = NULL;
+	struct aggregated_stats *values = NULL;
 	void *keys = NULL, *del_keys = NULL;
 	int n_cpus = libbpf_num_possible_cpus();
 	size_t keysize = af == AF_INET ? sizeof(__u32) : sizeof(__u64);
@@ -1419,7 +1492,7 @@ static int report_aggregated_rtt_map(struct output_context *out_ctx, int map_fd,
 		}
 
 		for (i = 0; i < count; i++) {
-			report_aggregated_rtt_mapentry(
+			report_aggregated_stats_mapentry(
 				out_ctx, keys + i * keysize,
 				values + i * n_cpus, n_cpus, af, prefix_len,
 				t_monotonic, agg_conf, &del_key);
@@ -1462,15 +1535,15 @@ static int report_aggregated_rtts(struct output_context *out_ctx,
 	if (map_idx < 0)
 		return map_idx;
 
-	err = report_aggregated_rtt_map(out_ctx, maps->map_v4_fd[map_idx],
-					AF_INET, agg_conf->ipv4_prefix_len, t,
-					agg_conf);
+	err = report_aggregated_stats_map(out_ctx, maps->map_v4_fd[map_idx],
+					  AF_INET, agg_conf->ipv4_prefix_len, t,
+					  agg_conf);
 	if (err)
 		return err;
 
-	err = report_aggregated_rtt_map(out_ctx, maps->map_v6_fd[map_idx],
-					AF_INET6, agg_conf->ipv6_prefix_len, t,
-					agg_conf);
+	err = report_aggregated_stats_map(out_ctx, maps->map_v6_fd[map_idx],
+					  AF_INET6, agg_conf->ipv6_prefix_len,
+					  t, agg_conf);
 	return err;
 }
 
@@ -1856,7 +1929,7 @@ int fetch_aggregation_map_fds(struct bpf_object *obj,
 static int init_agg_backup_entries(struct aggregation_maps *maps, bool ipv4,
 				   bool ipv6)
 {
-	struct aggregated_rtt_stats *empty_stats;
+	struct aggregated_stats *empty_stats;
 	struct ipprefix_key key;
 	int instance, err = 0;
 

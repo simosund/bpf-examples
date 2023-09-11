@@ -107,6 +107,7 @@ struct packet_info {
 	enum flow_event_type event_type; // flow event triggered by packet
 	enum flow_event_reason event_reason; // reason for triggering flow event
 	bool wait_first_edge;        // Do we need to wait for the first identifier change before timestamping?
+	bool rtt_trackable;          // Packet of type we can track RTT for
 };
 
 /*
@@ -127,10 +128,10 @@ char _license[] SEC("license") = "GPL";
 static volatile const struct bpf_config config = {};
 static volatile __u64 last_warn_time[2] = { 0 };
 
-// Keep an empty aggregated_rtt_stats as a global variable to use as a template
+// Keep an empty aggregated_stats as a global variable to use as a template
 // when creating new entries. That way, it won't have to be allocated on stack
 // (where it won't fit anyways) and initialized each time during run time.
-static struct aggregated_rtt_stats empty_stats = { 0 };
+static struct aggregated_stats empty_stats = { 0 };
 
 
 // Map definitions
@@ -157,28 +158,28 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u32);
-	__type(value, struct aggregated_rtt_stats);
+	__type(value, struct aggregated_stats);
 	__uint(max_entries, MAP_AGGREGATION_SIZE);
 } map_v4_agg1 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u32);
-	__type(value, struct aggregated_rtt_stats);
+	__type(value, struct aggregated_stats);
 	__uint(max_entries, MAP_AGGREGATION_SIZE);
 } map_v4_agg2 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u64);
-	__type(value, struct aggregated_rtt_stats);
+	__type(value, struct aggregated_stats);
 	__uint(max_entries, MAP_AGGREGATION_SIZE);
 } map_v6_agg1 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__type(key, __u64);
-	__type(value, struct aggregated_rtt_stats);
+	__type(value, struct aggregated_stats);
 	__uint(max_entries, MAP_AGGREGATION_SIZE);
 } map_v6_agg2 SEC(".maps");
 
@@ -512,9 +513,13 @@ static int parse_icmp_identifier(struct parsing_context *pctx,
  * Attempts to parse the packet defined by pctx for a valid packet identifier
  * and reply identifier, filling in p_info.
  *
- * If succesful, all members of p_info will be set appropriately and 0 will
- * be returned.
- * On failure -1 will be returned (no garantuees on p_info members).
+ * If it can't parse the the IP-header of the packet, it will return -1 and
+ * no information in p_info is valid.
+ * If it can parse the IP-header, it will return 0 and the flow information
+ * in p_info->pid.flow will be valid.
+ * If, additionally, it was able to identify the packet was of a type that
+ * the RTT can be tracked for, rtt_trackable will be set to true and all
+ * members of p_info will be set.
  */
 static int parse_packet_identifier(struct parsing_context *pctx,
 				   struct packet_info *p_info)
@@ -539,49 +544,18 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 	// Parse IPv4/6 header
 	if (proto == bpf_htons(ETH_P_IP)) {
 		p_info->pid.flow.ipv = AF_INET;
-		p_info->pid.flow.proto =
-			parse_iphdr(&pctx->nh, pctx->data_end, &iph_ptr.iph);
+		proto = parse_iphdr(&pctx->nh, pctx->data_end, &iph_ptr.iph);
 	} else if (proto == bpf_htons(ETH_P_IPV6)) {
 		p_info->pid.flow.ipv = AF_INET6;
-		p_info->pid.flow.proto =
-			parse_ip6hdr(&pctx->nh, pctx->data_end, &iph_ptr.ip6h);
+		proto = parse_ip6hdr(&pctx->nh, pctx->data_end, &iph_ptr.ip6h);
 	} else {
 		return -1;
 	}
+	if (proto < 0)
+		return -1;
 
-	// Parse identifer from suitable protocol
-	if (config.track_tcp && p_info->pid.flow.proto == IPPROTO_TCP)
-		err = parse_tcp_identifier(pctx, &transporth_ptr.tcph,
-					   &p_info->pid.flow.saddr.port,
-					   &p_info->pid.flow.daddr.port,
-					   &proto_info);
-	else if (config.track_icmp &&
-		 p_info->pid.flow.proto == IPPROTO_ICMPV6 &&
-		 p_info->pid.flow.ipv == AF_INET6)
-		err = parse_icmp6_identifier(pctx, &transporth_ptr.icmp6h,
-					     &p_info->pid.flow.saddr.port,
-					     &p_info->pid.flow.daddr.port,
-					     &proto_info);
-	else if (config.track_icmp && p_info->pid.flow.proto == IPPROTO_ICMP &&
-		 p_info->pid.flow.ipv == AF_INET)
-		err = parse_icmp_identifier(pctx, &transporth_ptr.icmph,
-					    &p_info->pid.flow.saddr.port,
-					    &p_info->pid.flow.daddr.port,
-					    &proto_info);
-	else
-		return -1; // No matching protocol
-	if (err)
-		return -1; // Failed parsing protocol
-
-	// Sucessfully parsed packet identifier - fill in remaining members and return
-	p_info->pid.identifier = proto_info.pid;
-	p_info->pid_valid = proto_info.pid_valid;
-	p_info->reply_pid.identifier = proto_info.reply_pid;
-	p_info->reply_pid_valid = proto_info.reply_pid_valid;
-	p_info->event_type = proto_info.event_type;
-	p_info->event_reason = proto_info.event_reason;
-	p_info->wait_first_edge = proto_info.wait_first_edge;
-
+	// IP-header was parsed sucessfully, fill in IP address
+	p_info->pid.flow.proto = proto;
 	if (p_info->pid.flow.ipv == AF_INET) {
 		map_ipv4_to_ipv6(&p_info->pid.flow.saddr.ip,
 				 iph_ptr.iph->saddr);
@@ -597,10 +571,47 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 			*(__be32 *)iph_ptr.ip6h & IPV6_FLOWINFO_MASK;
 	}
 
-	p_info->pid_flow_is_dfkey = is_dualflow_key(&p_info->pid.flow);
+	// Parse identifer from suitable protocol
+	err = -1;
+	if (config.track_tcp && proto == IPPROTO_TCP)
+		err = parse_tcp_identifier(pctx, &transporth_ptr.tcph,
+					   &p_info->pid.flow.saddr.port,
+					   &p_info->pid.flow.daddr.port,
+					   &proto_info);
+	else if (config.track_icmp && proto == IPPROTO_ICMPV6 &&
+		 p_info->pid.flow.ipv == AF_INET6)
+		err = parse_icmp6_identifier(pctx, &transporth_ptr.icmp6h,
+					     &p_info->pid.flow.saddr.port,
+					     &p_info->pid.flow.daddr.port,
+					     &proto_info);
+	else if (config.track_icmp && proto == IPPROTO_ICMP &&
+		 p_info->pid.flow.ipv == AF_INET)
+		err = parse_icmp_identifier(pctx, &transporth_ptr.icmph,
+					    &p_info->pid.flow.saddr.port,
+					    &p_info->pid.flow.daddr.port,
+					    &proto_info);
 
-	reverse_flow(&p_info->reply_pid.flow, &p_info->pid.flow);
-	p_info->payload = remaining_pkt_payload(pctx);
+	if (err) {
+		// Error parsing protocol, or no protocol matched
+		p_info->rtt_trackable = false;
+	} else {
+		// Sucessfully parsed packet identifier
+		// Fill in information needed for RTT-logic
+		p_info->rtt_trackable = true;
+
+		p_info->pid.identifier = proto_info.pid;
+		p_info->pid_valid = proto_info.pid_valid;
+		p_info->reply_pid.identifier = proto_info.reply_pid;
+		p_info->reply_pid_valid = proto_info.reply_pid_valid;
+		p_info->event_type = proto_info.event_type;
+		p_info->event_reason = proto_info.event_reason;
+		p_info->wait_first_edge = proto_info.wait_first_edge;
+
+		reverse_flow(&p_info->reply_pid.flow, &p_info->pid.flow);
+
+		p_info->pid_flow_is_dfkey = is_dualflow_key(&p_info->pid.flow);
+		p_info->payload = remaining_pkt_payload(pctx);
+	}
 
 	return 0;
 }
@@ -986,15 +997,15 @@ static void create_ipprefix_key_v6(__u64 *prefix_key, struct in6_addr *ip)
 	// *prefix_key = *(__u64 *)ip & config.ipv6_prefix_mask; // gives verifier rejection "misaligned stack access off"
 }
 
-static struct aggregated_rtt_stats *
-lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
+static struct aggregated_stats *
+lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv, bool create)
 {
-	struct aggregated_rtt_stats *agg;
+	struct aggregated_stats *agg;
 	struct ipprefix_key key;
 	__u32 *map_choice;
 	__u32 zero = 0;
 	void *agg_map;
-	int err;
+	int err = 0;
 
 	map_choice = bpf_map_lookup_elem(&map_active_agg_instance, &zero);
 	if (!map_choice)
@@ -1015,9 +1026,11 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
 		return agg;
 
 	// No existing entry, try to create new one
-	err = bpf_map_update_elem(agg_map, &key, &empty_stats, BPF_NOEXIST);
-	if (err && err != -EEXIST) {
-		// No space left in aggregation map - switch to backup entry
+	if (create)
+		err = bpf_map_update_elem(agg_map, &key, &empty_stats,
+					  BPF_NOEXIST);
+        // Cannot create new entry, switch to backup entry
+	if (!create || (err && err != -EEXIST)) {
 		if (ipv == AF_INET)
 			key.v4 = IPV4_BACKUP_KEY;
 		else
@@ -1027,21 +1040,21 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv)
 	return bpf_map_lookup_elem(agg_map, &key);
 }
 
-static void aggregate_rtt(__u64 rtt, struct aggregated_rtt_stats *agg_stats)
+static void aggregate_rtt(__u64 rtt, struct aggregated_stats *agg_stats)
 {
 	if (!config.agg_rtts || !agg_stats)
 		return;
 
 	int bin_idx;
 
-	if (!agg_stats->min || rtt < agg_stats->min)
-		agg_stats->min = rtt;
-	if (rtt > agg_stats->max)
-		agg_stats->max = rtt;
+	if (!agg_stats->rtt_min || rtt < agg_stats->rtt_min)
+		agg_stats->rtt_min = rtt;
+	if (rtt > agg_stats->rtt_max)
+		agg_stats->rtt_max = rtt;
 
 	bin_idx = rtt / RTT_AGG_BIN_WIDTH;
 	bin_idx = bin_idx >= RTT_AGG_NR_BINS ? RTT_AGG_NR_BINS - 1 : bin_idx;
-	agg_stats->bins[bin_idx]++;
+	agg_stats->rtt_bins[bin_idx]++;
 }
 
 /*
@@ -1090,7 +1103,7 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
  */
 static void pping_match_packet(struct flow_state *f_state, void *ctx,
 			       struct packet_info *p_info,
-			       struct aggregated_rtt_stats *agg_stats)
+			       struct aggregated_stats *agg_stats)
 {
 	__u64 rtt;
 	__u64 *p_ts;
@@ -1121,28 +1134,43 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	aggregate_rtt(rtt, agg_stats);
 }
 
-static void update_aggregate_stats(struct aggregated_rtt_stats **src_stats,
-				   struct aggregated_rtt_stats **dst_stats,
+static void update_subnet_pktcnt(struct aggregated_stats *stats,
+				 struct packet_info *p_info, bool as_tx)
+{
+	if (!stats)
+		return;
+
+	int dir_idx = as_tx ? TX_IDX : RX_IDX;
+	int group_idx =
+		p_info->pid.flow.proto == IPPROTO_TCP && p_info->rtt_trackable ?
+			AGG_PKTCNT_TCPTS :
+		p_info->pid.flow.proto == IPPROTO_TCP ? AGG_PKTCNT_TCPNOTS :
+							AGG_PKTCNT_OTHER;
+
+	stats->pkt_cnt[group_idx][dir_idx].packet_count++;
+	stats->pkt_cnt[group_idx][dir_idx].byte_count += p_info->pkt_len;
+
+	stats->last_updated = p_info->time;
+}
+
+static void update_aggregate_stats(struct aggregated_stats **src_stats,
+				   struct aggregated_stats **dst_stats,
 				   struct packet_info *p_info)
 {
 	if (!config.agg_rtts)
 		return;
 
-	*src_stats = lookup_or_create_aggregation_stats(
-		&p_info->pid.flow.saddr.ip, p_info->pid.flow.ipv);
-	if (*src_stats) {
-		(*src_stats)->last_updated = p_info->time;
-		(*src_stats)->tx_packet_count++;
-		(*src_stats)->tx_byte_count += p_info->pkt_len;
-	}
+	*src_stats =
+		lookup_or_create_aggregation_stats(&p_info->pid.flow.saddr.ip,
+						   p_info->pid.flow.ipv,
+						   p_info->rtt_trackable);
+	update_subnet_pktcnt(*src_stats, p_info, true);
 
-	*dst_stats = lookup_or_create_aggregation_stats(
-		&p_info->pid.flow.daddr.ip, p_info->pid.flow.ipv);
-	if (*dst_stats) {
-		(*dst_stats)->last_updated = p_info->time;
-		(*dst_stats)->rx_packet_count++;
-		(*dst_stats)->rx_byte_count += p_info->pkt_len;
-	}
+	*dst_stats =
+		lookup_or_create_aggregation_stats(&p_info->pid.flow.daddr.ip,
+						   p_info->pid.flow.ipv,
+						   p_info->rtt_trackable);
+	update_subnet_pktcnt(*dst_stats, p_info, false);
 }
 
 /*
@@ -1157,13 +1185,15 @@ static void pping_parsed_packet(void *ctx, struct packet_info *p_info)
 {
 	struct dual_flow_state *df_state;
 	struct flow_state *fw_flow, *rev_flow;
-	struct aggregated_rtt_stats *src_stats = NULL, *dst_stats = NULL;
+	struct aggregated_stats *src_stats = NULL, *dst_stats = NULL;
+
+	update_aggregate_stats(&src_stats, &dst_stats, p_info);
+	if (!p_info->rtt_trackable)
+		return;
 
 	df_state = lookup_or_create_dualflow_state(ctx, p_info);
 	if (!df_state)
 		return;
-
-	update_aggregate_stats(&src_stats, &dst_stats, p_info);
 
 	fw_flow = get_flowstate_from_packet(df_state, p_info);
 	update_forward_flowstate(p_info, fw_flow);

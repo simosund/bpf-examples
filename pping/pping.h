@@ -30,6 +30,10 @@ typedef __u64 fixpoint64;
 #define RTT_AGG_NR_BINS 250UL
 #define RTT_AGG_BIN_WIDTH (4 * NS_PER_MS)
 
+/* Index for TX/RX counters in aggregated_stats */
+#define TX_IDX 0
+#define RX_IDX 1
+
 /* Special IPv4/IPv6 prefixes used for backup entries
  * To avoid them colliding with and actual traffic (causing the traffic to end
  * up in the backup entry), use prefixes from blocks reserved for documentation.
@@ -79,6 +83,13 @@ enum __attribute__((__packed__)) connection_state {
         CONNECTION_STATE_WAITOPEN,
         CONNECTION_STATE_OPEN,
         CONNECTION_STATE_CLOSED
+};
+
+enum agg_pktcnt_group {
+	AGG_PKTCNT_TCPTS = 0,
+	AGG_PKTCNT_TCPNOTS,
+	AGG_PKTCNT_OTHER,
+	AGG_PKTCNT_N_GROUPS
 };
 
 struct bpf_config {
@@ -245,15 +256,20 @@ union pping_event {
 	struct map_clean_event map_clean_event;
 };
 
-struct aggregated_rtt_stats {
+struct packet_counters {
+	__u64 packet_count;
+	__u64 byte_count;
+};
+
+struct aggregated_stats {
 	__u64 last_updated;
-	__u64 rx_packet_count;
-	__u64 tx_packet_count;
-	__u64 rx_byte_count;
-	__u64 tx_byte_count;
-	__u64 min;
-	__u64 max;
-	__u32 bins[RTT_AGG_NR_BINS];
+	/* Matrix of packet counters.
+	 * First index determine group of counters (see subnet_pktcnt_groups).
+	 * Second index determine if counters are for RX/TX (see {TX,RX}_IDX) */
+	struct packet_counters pkt_cnt[AGG_PKTCNT_N_GROUPS][2];
+	__u64 rtt_min;
+	__u64 rtt_max;
+	__u32 rtt_bins[RTT_AGG_NR_BINS];
 };
 
 #endif
