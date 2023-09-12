@@ -78,6 +78,19 @@ struct parsing_context {
 };
 
 /*
+ * Struct filled in by protocol id parsers (ex. parse_tcp_identifier)
+ */
+struct protocol_info {
+	__u32 pid;
+	__u32 reply_pid;
+	bool pid_valid;
+	bool reply_pid_valid;
+	enum flow_event_type event_type;
+	enum flow_event_reason event_reason;
+	bool wait_first_edge;
+};
+
+/*
  * Struct filled in by parse_packet_id.
  *
  * Note: As long as parse_packet_id is successful, the flow-parts of pid
@@ -92,8 +105,9 @@ struct packet_info {
 	__u64 time;                  // Arrival time of packet
 	__u32 pkt_len;               // Size of packet (including headers)
 	__u32 payload;               // Size of packet data (excluding headers)
-	struct packet_id pid;        // flow + identifier to timestamp (ex. TSval)
-	struct packet_id reply_pid;  // rev. flow + identifier to match against (ex. TSecr)
+	struct network_tuple flow;   // The 5-tuple
+	struct network_tuple dualflow_key; // Key to use to get dualflow-state for flow
+	struct protocol_info proto;  // Protocol-specific information used for the RTT-logic
 	__u32 ingress_ifindex;       // Interface packet arrived on (if is_ingress, otherwise not valid)
 	union {                      // The IP-level "type of service" (DSCP for IPv4, traffic class + flow label for IPv6)
 		__u8 ipv4_tos;
@@ -101,25 +115,7 @@ struct packet_info {
 	} ip_tos;
 	__u16 ip_len;                // The IPv4 total length or IPv6 payload length
 	bool is_ingress;             // Packet on egress or ingress?
-	bool pid_flow_is_dfkey;      // Used to determine which member of dualflow state to use for forward direction
-	bool pid_valid;              // identifier can be used to timestamp packet
-	bool reply_pid_valid;        // reply_identifier can be used to match packet
-	enum flow_event_type event_type; // flow event triggered by packet
-	enum flow_event_reason event_reason; // reason for triggering flow event
-	bool wait_first_edge;        // Do we need to wait for the first identifier change before timestamping?
-};
-
-/*
- * Struct filled in by protocol id parsers (ex. parse_tcp_identifier)
- */
-struct protocol_info {
-	__u32 pid;
-	__u32 reply_pid;
-	bool pid_valid;
-	bool reply_pid_valid;
-	enum flow_event_type event_type;
-	enum flow_event_reason event_reason;
-	bool wait_first_edge;
+	bool flow_match_dir1;          // If true, the flow matches the "dir1" member of the dualflow state
 };
 
 char _license[] SEC("license") = "GPL";
@@ -259,18 +255,22 @@ static bool is_dualflow_key(struct network_tuple *flow)
 }
 
 static void make_dualflow_key(struct network_tuple *key,
-			      struct network_tuple *flow)
+			      struct network_tuple *flow, bool *match_dir1)
 {
-	if (is_dualflow_key(flow))
+	bool is_dfkey = is_dualflow_key(flow);
+	if (is_dfkey)
 		*key = *flow;
 	else
 		reverse_flow(key, flow);
+
+	if (match_dir1)
+		*match_dir1 = is_dfkey;
 }
 
 static struct flow_state *fstate_from_dfkey(struct dual_flow_state *df_state,
-					    bool is_dfkey)
+					    bool match_dir1)
 {
-	return is_dfkey ? &df_state->dir1 : &df_state->dir2;
+	return match_dir1 ? &df_state->dir1 : &df_state->dir2;
 }
 
 /*
@@ -290,21 +290,14 @@ static struct flow_state *
 get_flowstate_from_packet(struct dual_flow_state *df_state,
 			  struct packet_info *p_info)
 {
-	return fstate_from_dfkey(df_state, p_info->pid_flow_is_dfkey);
+	return fstate_from_dfkey(df_state, p_info->flow_match_dir1);
 }
 
 static struct flow_state *
 get_reverse_flowstate_from_packet(struct dual_flow_state *df_state,
 				  struct packet_info *p_info)
 {
-	return fstate_from_dfkey(df_state, !p_info->pid_flow_is_dfkey);
-}
-
-static struct network_tuple *
-get_dualflow_key_from_packet(struct packet_info *p_info)
-{
-	return p_info->pid_flow_is_dfkey ? &p_info->pid.flow :
-						 &p_info->reply_pid.flow;
+	return fstate_from_dfkey(df_state, !p_info->flow_match_dir1);
 }
 
 /*
@@ -521,7 +514,6 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 {
 	int proto, err;
 	struct ethhdr *eth;
-	struct protocol_info proto_info;
 	union {
 		struct iphdr *iph;
 		struct ipv6hdr *ip6h;
@@ -538,69 +530,61 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 
 	// Parse IPv4/6 header
 	if (proto == bpf_htons(ETH_P_IP)) {
-		p_info->pid.flow.ipv = AF_INET;
-		p_info->pid.flow.proto =
+		p_info->flow.ipv = AF_INET;
+		p_info->flow.proto =
 			parse_iphdr(&pctx->nh, pctx->data_end, &iph_ptr.iph);
 	} else if (proto == bpf_htons(ETH_P_IPV6)) {
-		p_info->pid.flow.ipv = AF_INET6;
-		p_info->pid.flow.proto =
+		p_info->flow.ipv = AF_INET6;
+		p_info->flow.proto =
 			parse_ip6hdr(&pctx->nh, pctx->data_end, &iph_ptr.ip6h);
 	} else {
 		return -1;
 	}
 
 	// Parse identifer from suitable protocol
-	if (config.track_tcp && p_info->pid.flow.proto == IPPROTO_TCP)
+	if (config.track_tcp && p_info->flow.proto == IPPROTO_TCP)
 		err = parse_tcp_identifier(pctx, &transporth_ptr.tcph,
-					   &p_info->pid.flow.saddr.port,
-					   &p_info->pid.flow.daddr.port,
-					   &proto_info);
+					   &p_info->flow.saddr.port,
+					   &p_info->flow.daddr.port,
+					   &p_info->proto);
 	else if (config.track_icmp &&
-		 p_info->pid.flow.proto == IPPROTO_ICMPV6 &&
-		 p_info->pid.flow.ipv == AF_INET6)
+		 p_info->flow.proto == IPPROTO_ICMPV6 &&
+		 p_info->flow.ipv == AF_INET6)
 		err = parse_icmp6_identifier(pctx, &transporth_ptr.icmp6h,
-					     &p_info->pid.flow.saddr.port,
-					     &p_info->pid.flow.daddr.port,
-					     &proto_info);
-	else if (config.track_icmp && p_info->pid.flow.proto == IPPROTO_ICMP &&
-		 p_info->pid.flow.ipv == AF_INET)
+					     &p_info->flow.saddr.port,
+					     &p_info->flow.daddr.port,
+					     &p_info->proto);
+	else if (config.track_icmp && p_info->flow.proto == IPPROTO_ICMP &&
+		 p_info->flow.ipv == AF_INET)
 		err = parse_icmp_identifier(pctx, &transporth_ptr.icmph,
-					    &p_info->pid.flow.saddr.port,
-					    &p_info->pid.flow.daddr.port,
-					    &proto_info);
+					    &p_info->flow.saddr.port,
+					    &p_info->flow.daddr.port,
+					    &p_info->proto);
 	else
 		return -1; // No matching protocol
 	if (err)
 		return -1; // Failed parsing protocol
 
 	// Sucessfully parsed packet identifier - fill in remaining members and return
-	p_info->pid.identifier = proto_info.pid;
-	p_info->pid_valid = proto_info.pid_valid;
-	p_info->reply_pid.identifier = proto_info.reply_pid;
-	p_info->reply_pid_valid = proto_info.reply_pid_valid;
-	p_info->event_type = proto_info.event_type;
-	p_info->event_reason = proto_info.event_reason;
-	p_info->wait_first_edge = proto_info.wait_first_edge;
-
-	if (p_info->pid.flow.ipv == AF_INET) {
-		map_ipv4_to_ipv6(&p_info->pid.flow.saddr.ip,
+	if (p_info->flow.ipv == AF_INET) {
+		map_ipv4_to_ipv6(&p_info->flow.saddr.ip,
 				 iph_ptr.iph->saddr);
-		map_ipv4_to_ipv6(&p_info->pid.flow.daddr.ip,
+		map_ipv4_to_ipv6(&p_info->flow.daddr.ip,
 				 iph_ptr.iph->daddr);
 		p_info->ip_len = bpf_ntohs(iph_ptr.iph->tot_len);
 		p_info->ip_tos.ipv4_tos = iph_ptr.iph->tos;
 	} else { // IPv6
-		p_info->pid.flow.saddr.ip = iph_ptr.ip6h->saddr;
-		p_info->pid.flow.daddr.ip = iph_ptr.ip6h->daddr;
+		p_info->flow.saddr.ip = iph_ptr.ip6h->saddr;
+		p_info->flow.daddr.ip = iph_ptr.ip6h->daddr;
 		p_info->ip_len = bpf_ntohs(iph_ptr.ip6h->payload_len);
 		p_info->ip_tos.ipv6_tos =
 			*(__be32 *)iph_ptr.ip6h & IPV6_FLOWINFO_MASK;
 	}
 
-	p_info->pid_flow_is_dfkey = is_dualflow_key(&p_info->pid.flow);
-
-	reverse_flow(&p_info->reply_pid.flow, &p_info->pid.flow);
 	p_info->payload = remaining_pkt_payload(pctx);
+
+	make_dualflow_key(&p_info->dualflow_key, &p_info->flow,
+			  &p_info->flow_match_dir1);
 
 	return 0;
 }
@@ -687,7 +671,7 @@ static void send_flow_open_event(void *ctx, struct packet_info *p_info,
 		.event_type = EVENT_TYPE_FLOW,
 		.flow_event_type = FLOW_EVENT_OPENING,
 		.source = EVENT_SOURCE_PKT_DEST,
-		.flow = p_info->pid.flow,
+		.flow = p_info->flow,
 		.reason = rev_flow->opening_reason,
 		.timestamp = rev_flow->last_timestamp,
 		.reserved = 0,
@@ -711,17 +695,17 @@ static void send_flow_event(void *ctx, struct packet_info *p_info,
 
 	struct flow_event fe = {
 		.event_type = EVENT_TYPE_FLOW,
-		.flow_event_type = p_info->event_type,
-		.reason = p_info->event_reason,
+		.flow_event_type = p_info->proto.event_type,
+		.reason = p_info->proto.event_reason,
 		.timestamp = p_info->time,
 		.reserved = 0, // Make sure it's initilized
 	};
 
 	if (rev_flow) {
-		fe.flow = p_info->pid.flow;
+		fe.flow = p_info->flow;
 		fe.source = EVENT_SOURCE_PKT_SRC;
 	} else {
-		fe.flow = p_info->reply_pid.flow;
+		reverse_flow(&fe.flow, &p_info->flow);
 		fe.source = EVENT_SOURCE_PKT_DEST;
 	}
 
@@ -746,7 +730,7 @@ static void send_map_full_event(void *ctx, struct packet_info *p_info,
 	__builtin_memset(&me, 0, sizeof(me));
 	me.event_type = EVENT_TYPE_MAP_FULL;
 	me.timestamp = p_info->time;
-	me.flow = p_info->pid.flow;
+	me.flow = p_info->flow;
 	me.map = map;
 
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &me, sizeof(me));
@@ -761,7 +745,7 @@ static void send_rtt_event(void *ctx, __u64 rtt, struct flow_state *f_state,
 	struct rtt_event re = {
 		.event_type = EVENT_TYPE_RTT,
 		.timestamp = p_info->time,
-		.flow = p_info->pid.flow,
+		.flow = p_info->flow,
 		.padding = 0,
 		.rtt = rtt,
 		.min_rtt = f_state->min_rtt,
@@ -787,10 +771,11 @@ static void init_flowstate(struct flow_state *f_state,
 	f_state->last_timestamp = p_info->time;
 	/* We should only ever create new flows for packet with valid pid,
 	   so assume pid is valid*/
-	f_state->last_id = p_info->pid.identifier;
-	f_state->opening_reason = p_info->event_type == FLOW_EVENT_OPENING ?
-					  p_info->event_reason :
-						EVENT_REASON_FIRST_OBS_PCKT;
+	f_state->last_id = p_info->proto.pid;
+	f_state->opening_reason =
+		p_info->proto.event_type == FLOW_EVENT_OPENING ?
+			p_info->proto.event_reason :
+			EVENT_REASON_FIRST_OBS_PCKT;
 	f_state->has_been_timestamped = false;
 }
 
@@ -816,21 +801,24 @@ static void init_dualflow_state(struct dual_flow_state *df_state,
 	init_empty_flowstate(rev_state);
 }
 
-static struct dual_flow_state *
-create_dualflow_state(void *ctx, struct packet_info *p_info)
+static struct dual_flow_state *create_dualflow_state(void *ctx,
+						     struct packet_info *p_info)
 {
-	struct network_tuple *key = get_dualflow_key_from_packet(p_info);
+	// struct network_tuple *key = get_dualflow_key_from_packet(p_info);
+	// struct network_tuple *key = &p_info->dualflow_key;
 	struct dual_flow_state new_state = { 0 };
+	int err;
 
 	init_dualflow_state(&new_state, p_info);
 
-	if (bpf_map_update_elem(&flow_state, key, &new_state, BPF_NOEXIST) !=
-	    0) {
+	err = bpf_map_update_elem(&flow_state, &p_info->dualflow_key,
+				  &new_state, BPF_NOEXIST);
+	if (err && err != -EEXIST) {
 		send_map_full_event(ctx, p_info, PPING_MAP_FLOWSTATE);
 		return NULL;
 	}
 
-	return bpf_map_lookup_elem(&flow_state, key);
+	return bpf_map_lookup_elem(&flow_state, &p_info->dualflow_key);
 }
 
 static struct dual_flow_state *
@@ -838,15 +826,15 @@ lookup_or_create_dualflow_state(void *ctx, struct packet_info *p_info)
 {
 	struct dual_flow_state *df_state;
 
-	df_state = bpf_map_lookup_elem(&flow_state,
-				       get_dualflow_key_from_packet(p_info));
+	df_state = bpf_map_lookup_elem(&flow_state, &p_info->dualflow_key);
 
 	if (df_state)
 		return df_state;
 
 	// Only try to create new state if we have a valid pid
-	if (!p_info->pid_valid || p_info->event_type == FLOW_EVENT_CLOSING ||
-	    p_info->event_type == FLOW_EVENT_CLOSING_BOTH)
+	if (!p_info->proto.pid_valid ||
+	    p_info->proto.event_type == FLOW_EVENT_CLOSING ||
+	    p_info->proto.event_type == FLOW_EVENT_CLOSING_BOTH)
 		return NULL;
 
 	return create_dualflow_state(ctx, p_info);
@@ -862,7 +850,8 @@ static void update_forward_flowstate(struct packet_info *p_info,
 				     struct flow_state *f_state)
 {
 	// "Create" flowstate if it's empty
-	if (f_state->conn_state == CONNECTION_STATE_EMPTY && p_info->pid_valid)
+	if (f_state->conn_state == CONNECTION_STATE_EMPTY &&
+	    p_info->proto.pid_valid)
 		init_flowstate(f_state, p_info);
 
 	if (is_flowstate_active(f_state)) {
@@ -879,7 +868,7 @@ static void update_reverse_flowstate(void *ctx, struct packet_info *p_info,
 
 	// First time we see reply for flow?
 	if (f_state->conn_state == CONNECTION_STATE_WAITOPEN &&
-	    p_info->event_type != FLOW_EVENT_CLOSING_BOTH) {
+	    p_info->proto.event_type != FLOW_EVENT_CLOSING_BOTH) {
 		f_state->conn_state = CONNECTION_STATE_OPEN;
 		send_flow_open_event(ctx, p_info, f_state);
 	}
@@ -898,15 +887,15 @@ static void close_and_delete_flows(void *ctx, struct packet_info *p_info,
 				   struct flow_state *rev_flow)
 {
 	// Forward flow closing
-	if (p_info->event_type == FLOW_EVENT_CLOSING ||
-	    p_info->event_type == FLOW_EVENT_CLOSING_BOTH) {
+	if (p_info->proto.event_type == FLOW_EVENT_CLOSING ||
+	    p_info->proto.event_type == FLOW_EVENT_CLOSING_BOTH) {
 		if (should_notify_closing(fw_flow))
 			send_flow_event(ctx, p_info, false);
 		fw_flow->conn_state = CONNECTION_STATE_CLOSED;
 	}
 
 	// Reverse flow closing
-	if (p_info->event_type == FLOW_EVENT_CLOSING_BOTH) {
+	if (p_info->proto.event_type == FLOW_EVENT_CLOSING_BOTH) {
 		if (should_notify_closing(rev_flow))
 			send_flow_event(ctx, p_info, true);
 		rev_flow->conn_state = CONNECTION_STATE_CLOSED;
@@ -914,8 +903,7 @@ static void close_and_delete_flows(void *ctx, struct packet_info *p_info,
 
 	// Delete flowstate entry if neither flow is open anymore
 	if (!is_flowstate_active(fw_flow) && !is_flowstate_active(rev_flow)) {
-		if (bpf_map_delete_elem(&flow_state,
-					get_dualflow_key_from_packet(p_info)) ==
+		if (bpf_map_delete_elem(&flow_state, &p_info->dualflow_key) ==
 		    0)
 			debug_increment_autodel(PPING_MAP_FLOWSTATE);
 	}
@@ -936,23 +924,23 @@ static bool is_local_address(struct packet_info *p_info, void *ctx)
 	__builtin_memset(&lookup, 0, sizeof(lookup));
 
 	lookup.ifindex = p_info->ingress_ifindex;
-	lookup.family = p_info->pid.flow.ipv;
+	lookup.family = p_info->flow.ipv;
 	lookup.tot_len = p_info->ip_len;
 
 	if (lookup.family == AF_INET) {
 		lookup.tos = p_info->ip_tos.ipv4_tos;
-		lookup.ipv4_src = ipv4_from_ipv6(&p_info->pid.flow.saddr.ip);
-		lookup.ipv4_dst = ipv4_from_ipv6(&p_info->pid.flow.daddr.ip);
+		lookup.ipv4_src = ipv4_from_ipv6(&p_info->flow.saddr.ip);
+		lookup.ipv4_dst = ipv4_from_ipv6(&p_info->flow.daddr.ip);
 	} else if (lookup.family == AF_INET6) {
 		struct in6_addr *src = (struct in6_addr *)lookup.ipv6_src;
 		struct in6_addr *dst = (struct in6_addr *)lookup.ipv6_dst;
 
 		lookup.flowinfo = p_info->ip_tos.ipv6_tos;
-		*src = p_info->pid.flow.saddr.ip;
-		*dst = p_info->pid.flow.daddr.ip;
+		*src = p_info->flow.saddr.ip;
+		*dst = p_info->flow.daddr.ip;
 	}
 
-	lookup.l4_protocol = p_info->pid.flow.proto;
+	lookup.l4_protocol = p_info->flow.proto;
 	lookup.sport = 0;
 	lookup.dport = 0;
 
@@ -1050,7 +1038,11 @@ static void aggregate_rtt(__u64 rtt, struct aggregated_rtt_stats *agg_stats)
 static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 				   struct packet_info *p_info)
 {
-	if (!is_flowstate_active(f_state) || !p_info->pid_valid)
+	struct packet_id pid = { .flow = p_info->flow,
+				 .identifier = p_info->proto.pid };
+	int err;
+
+	if (!is_flowstate_active(f_state) || !p_info->proto.pid_valid)
 		return;
 
 	if (config.localfilt && p_info->is_ingress &&
@@ -1058,10 +1050,10 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 		return;
 
 	// Check if identfier is new
-	if ((f_state->has_been_timestamped || p_info->wait_first_edge) &&
-	    !is_new_identifier(&p_info->pid, f_state))
+	if ((f_state->has_been_timestamped || p_info->proto.wait_first_edge) &&
+	    !is_new_identifier(&pid, f_state))
 		return;
-	f_state->last_id = p_info->pid.identifier;
+	f_state->last_id = pid.identifier;
 
 	// Check rate-limit
 	if (f_state->has_been_timestamped &&
@@ -1078,8 +1070,8 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 	f_state->has_been_timestamped = true;
 	f_state->last_timestamp = p_info->time;
 
-	if (bpf_map_update_elem(&packet_ts, &p_info->pid, &p_info->time,
-				BPF_NOEXIST) == 0)
+	if (bpf_map_update_elem(&packet_ts, &pid, &p_info->time, BPF_NOEXIST) ==
+	    0)
 		__sync_fetch_and_add(&f_state->outstanding_timestamps, 1);
 	else
 		send_map_full_event(ctx, p_info, PPING_MAP_PACKETTS);
@@ -1092,23 +1084,26 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 			       struct packet_info *p_info,
 			       struct aggregated_rtt_stats *agg_stats)
 {
+	struct packet_id pid;
 	__u64 rtt;
 	__u64 *p_ts;
 
-	if (!is_flowstate_active(f_state) || !p_info->reply_pid_valid)
+	if (!is_flowstate_active(f_state) || !p_info->proto.reply_pid_valid)
 		return;
 
 	if (f_state->outstanding_timestamps == 0)
 		return;
 
-	p_ts = bpf_map_lookup_elem(&packet_ts, &p_info->reply_pid);
+	reverse_flow(&pid.flow, &p_info->flow);
+	pid.identifier = p_info->proto.reply_pid;
+	p_ts = bpf_map_lookup_elem(&packet_ts, &pid);
 	if (!p_ts || p_info->time < *p_ts)
 		return;
 
 	rtt = p_info->time - *p_ts;
 
 	// Delete timestamp entry as soon as RTT is calculated
-	if (bpf_map_delete_elem(&packet_ts, &p_info->reply_pid) == 0) {
+	if (bpf_map_delete_elem(&packet_ts, &pid) == 0) {
 		__sync_fetch_and_add(&f_state->outstanding_timestamps, -1);
 		debug_increment_autodel(PPING_MAP_PACKETTS);
 	}
@@ -1128,16 +1123,16 @@ static void update_aggregate_stats(struct aggregated_rtt_stats **src_stats,
 	if (!config.agg_rtts)
 		return;
 
-	*src_stats = lookup_or_create_aggregation_stats(
-		&p_info->pid.flow.saddr.ip, p_info->pid.flow.ipv);
+	*src_stats = lookup_or_create_aggregation_stats(&p_info->flow.saddr.ip,
+							p_info->flow.ipv);
 	if (*src_stats) {
 		(*src_stats)->last_updated = p_info->time;
 		(*src_stats)->tx_packet_count++;
 		(*src_stats)->tx_byte_count += p_info->pkt_len;
 	}
 
-	*dst_stats = lookup_or_create_aggregation_stats(
-		&p_info->pid.flow.daddr.ip, p_info->pid.flow.ipv);
+	*dst_stats = lookup_or_create_aggregation_stats(&p_info->flow.daddr.ip,
+							p_info->flow.ipv);
 	if (*dst_stats) {
 		(*dst_stats)->last_updated = p_info->time;
 		(*dst_stats)->rx_packet_count++;
@@ -1296,6 +1291,7 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	__u64 *timestamp = ctx->value;
 	__u64 now = bpf_ktime_get_ns();
 	__u64 rtt;
+	bool match_dir1;
 
 	debug_update_mapclean_stats(ctx, &events, !ctx->key || !ctx->value,
 				    ctx->meta->seq_num, now,
@@ -1306,10 +1302,10 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	if (now <= *timestamp)
 		return 0;
 
-	make_dualflow_key(&df_key, &pid->flow);
+	make_dualflow_key(&df_key, &pid->flow, &match_dir1);
 	df_state = bpf_map_lookup_elem(&flow_state, &df_key);
 	if (df_state)
-		f_state = get_flowstate_from_dualflow(df_state, &pid->flow);
+		f_state = fstate_from_dfkey(df_state, match_dir1);
 	rtt = f_state ? f_state->srtt : 0;
 
 	if ((rtt && now - *timestamp > rtt * TIMESTAMP_RTT_LIFETIME) ||
