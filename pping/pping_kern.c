@@ -197,6 +197,13 @@ struct {
 	__uint(max_entries, 1);
 } map_packet_info SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct global_packet_counters);
+	__uint(max_entries, 1);
+} map_global_counters SEC(".maps");
+
 // Help functions
 
 /*
@@ -312,6 +319,28 @@ get_dualflow_key_from_packet(struct packet_info *p_info)
 {
 	return p_info->pid_flow_is_dfkey ? &p_info->pid.flow :
 						 &p_info->reply_pid.flow;
+}
+
+static void update_global_counters(__u32 pkt_len, int ipproto)
+{
+	if (!config.global_counters)
+		return;
+
+	__u32 key = 0;
+	struct global_packet_counters *glob_count;
+
+	glob_count = bpf_map_lookup_elem(&map_global_counters, &key);
+	if (!glob_count) // Should never happen
+		return;
+
+	if (ipproto < 0) {
+		glob_count->non_ip.packet_count++;
+		glob_count->non_ip.byte_count += pkt_len;
+	} else {
+		ipproto &= 0xff;
+		glob_count->ip_protos[ipproto].packet_count++;
+		glob_count->ip_protos[ipproto].byte_count += pkt_len;
+	}
 }
 
 /*
@@ -556,10 +585,10 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 		p_info->pid.flow.ipv = AF_INET6;
 		proto = parse_ip6hdr(&pctx->nh, pctx->data_end, &iph_ptr.ip6h);
 	} else {
-		return -1;
+		goto err_not_ip;
 	}
 	if (proto < 0)
-		return -1;
+		goto err_not_ip;
 
 	// IP-header was parsed sucessfully, fill in IP address
 	p_info->pid.flow.proto = proto;
@@ -577,6 +606,10 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 		p_info->ip_tos.ipv6_tos =
 			*(__be32 *)iph_ptr.ip6h & IPV6_FLOWINFO_MASK;
 	}
+
+	// Has to be placed after IP-address copied, otherwise verifier loses track
+	// and thinks IP-address might access data outside packet bounds
+	update_global_counters(p_info->pkt_len, proto);
 
 	// Parse identifer from suitable protocol
 	err = -1;
@@ -621,6 +654,10 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 	}
 
 	return 0;
+
+err_not_ip:
+	update_global_counters(p_info->pkt_len, -1);
+	return -1;
 }
 
 /*
