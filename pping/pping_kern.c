@@ -197,6 +197,13 @@ struct {
 	__uint(max_entries, 1);
 } map_packet_info SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct global_packet_counters);
+	__uint(max_entries, 1);
+} map_global_counters SEC(".maps");
+
 // Help functions
 
 /*
@@ -1180,6 +1187,27 @@ static void update_aggregate_stats(struct aggregated_stats **src_stats,
 	update_subnet_pktcnt(*dst_stats, p_info, false);
 }
 
+static void update_global_counters(__u32 pkt_len, bool is_ip, __u8 ipproto)
+{
+	if (!config.global_counters)
+		return;
+
+	__u32 key = 0;
+	struct global_packet_counters *glob_count;
+
+	glob_count = bpf_map_lookup_elem(&map_global_counters, &key);
+	if (!glob_count) // Should never happen
+		return;
+
+	if (is_ip) {
+		glob_count->ip_protos[ipproto].packet_count++;
+		glob_count->ip_protos[ipproto].byte_count += pkt_len;
+	} else {
+		glob_count->non_ip.packet_count++;
+		glob_count->non_ip.byte_count += pkt_len;
+	}
+}
+
 /*
  * Contains the actual pping logic that is applied after a packet has been
  * parsed and deemed to contain some valid identifier.
@@ -1228,12 +1256,15 @@ static void pping_tc(struct __sk_buff *ctx, bool is_ingress)
 {
 	struct packet_info *p_info;
 	__u32 key = 0;
+	int ret;
 
 	p_info = bpf_map_lookup_elem(&map_packet_info, &key);
 	if (!p_info)
 		return;
 
-	if (parse_packet_identifer_tc(ctx, p_info) < 0)
+	ret = parse_packet_identifer_tc(ctx, p_info);
+	update_global_counters(ctx->len, ret >= 0, p_info->pid.flow.proto);
+	if (ret < 0)
 		return;
 
 	p_info->is_ingress = is_ingress;
@@ -1246,12 +1277,16 @@ static void pping_xdp(struct xdp_md *ctx)
 {
 	struct packet_info *p_info;
 	__u32 key = 0;
+	int ret;
 
 	p_info = bpf_map_lookup_elem(&map_packet_info, &key);
 	if (!p_info)
 		return;
 
-	if (parse_packet_identifer_xdp(ctx, p_info) < 0)
+	ret = parse_packet_identifer_xdp(ctx, p_info);
+	update_global_counters(ctx->data_end - ctx->data, ret >= 0,
+			       p_info->pid.flow.proto);
+	if (ret < 0)
 		return;
 
 	p_info->is_ingress = true;

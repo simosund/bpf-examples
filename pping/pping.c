@@ -55,9 +55,11 @@ static const char *__doc__ =
 #define PPING_EPEVENT_TYPE_SIGNAL (1ULL << 62)
 #define PPING_EPEVENT_TYPE_PIPE (1ULL << 61)
 #define PPING_EPEVENT_TYPE_AGGTIMER (1ULL << 60)
+#define PPING_EPEVENT_TYPE_GLOBCNTTIMER (1ULL << 59)
 #define PPING_EPEVENT_MASK                                                     \
 	(~(PPING_EPEVENT_TYPE_PERFBUF | PPING_EPEVENT_TYPE_SIGNAL |            \
-	   PPING_EPEVENT_TYPE_PIPE | PPING_EPEVENT_TYPE_AGGTIMER))
+	   PPING_EPEVENT_TYPE_PIPE | PPING_EPEVENT_TYPE_AGGTIMER |             \
+	   PPING_EPEVENT_TYPE_GLOBCNTTIMER))
 
 #define AGG_BATCH_SIZE 64 // Batch size for fetching aggregation maps (bpf_map_lookup_batch)
 
@@ -140,6 +142,9 @@ struct pping_config {
 	char *packet_map;
 	char *flow_map;
 	char *event_map;
+	char *globcnt_map;
+	__u64 globcnt_interval;
+	int globcnt_map_fd;
 	int ifindex;
 	struct xdp_program *xdp_prog;
 	int ingress_prog_id;
@@ -174,6 +179,7 @@ static const struct option long_options[] = {
 	{ "aggregate-reverse",    no_argument,       NULL, ARG_AGG_REVERSE }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
 	{ "aggregate-timeout",    required_argument, NULL, AGG_ARG_TIMEOUT }, // Interval for timing out subnet entries in seconds (default 30s)
 	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
+	{ "global-counters",      required_argument, NULL, 'g' }, // Output global packets counters every X seconds
 	{ 0, 0, NULL, 0 }
 };
 
@@ -282,8 +288,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.push_individual_events = true;
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
+	config->bpf_config.global_counters = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:4:6:w:",
+	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:4:6:w:g:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -444,6 +451,16 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			memcpy(config->filename, optarg, len);
 			config->filename[len] = '\0';
 			config->write_to_file = true;
+			break;
+		case 'g':
+			err = parse_bounded_long(&user_int, optarg, 1,
+						 7 * S_PER_DAY,
+						 "global-counters");
+			if (err)
+				return -EINVAL;
+
+			config->globcnt_interval = user_int * NS_PER_SECOND;
+			config->bpf_config.global_counters = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -876,10 +893,16 @@ static const char *proto_to_str(__u16 proto)
 	switch (proto) {
 	case IPPROTO_TCP:
 		return "TCP";
+	case IPPROTO_UDP:
+		return "UDP";
 	case IPPROTO_ICMP:
 		return "ICMP";
 	case IPPROTO_ICMPV6:
 		return "ICMPv6";
+	case IPPROTO_DCCP:
+		return "DCCP";
+	case IPPROTO_SCTP:
+		return "SCTP";
 	default:
 		snprintf(buf, sizeof(buf), "%d", proto);
 		return buf;
@@ -1547,6 +1570,158 @@ static int report_aggregated_rtts(struct output_context *out_ctx,
 	return err;
 }
 
+static void print_protocounters_standard(FILE *stream, const char *proto,
+					 const struct packet_counters *cnt)
+{
+	fprintf(stream, "%s: pkts=%llu, bytes=%llu", proto, cnt->packet_count,
+		cnt->byte_count);
+}
+
+static void
+print_globalcounters_standard(FILE *stream, __u64 t_monotonic,
+			      const struct global_packet_counters *cnt)
+{
+	bool first = true;
+	int proto;
+
+	print_ns_datetime(stream, t_monotonic);
+	fprintf(stream, ": ");
+
+	if (cnt->non_ip.packet_count > 0) {
+		first = false;
+		print_protocounters_standard(stream, "NON-IP", &cnt->non_ip);
+	}
+
+	for (proto = 0; proto < GLOBCOUNT_N_IPPROTS; proto++) {
+		if (cnt->ip_protos[proto].packet_count > 0) {
+			if (first)
+				first = false;
+			else
+				fprintf(stream, ", ");
+			print_protocounters_standard(stream,
+						     proto_to_str(proto),
+						     &cnt->ip_protos[proto]);
+		}
+	}
+
+	if (first) // Global counters are empty
+		fprintf(stream, "pkts=0, bytes=0\n");
+	else
+		fprintf(stream, "\n");
+}
+
+static void print_protocounters_json(json_writer_t *jctx, const char *proto,
+				     const struct packet_counters *cnt)
+{
+	jsonw_start_object(jctx);
+	jsonw_string_field(jctx, "protocol", proto);
+	jsonw_u64_field(jctx, "packets", cnt->packet_count);
+	jsonw_u64_field(jctx, "bytes", cnt->byte_count);
+	jsonw_end_object(jctx);
+}
+
+static void print_globalcounters_json(json_writer_t *jctx, __u64 t_monotonic,
+				      const struct global_packet_counters *cnt)
+{
+	int proto;
+
+	jsonw_start_object(jctx);
+	jsonw_u64_field(jctx, "timestamp",
+			convert_monotonic_to_realtime(t_monotonic));
+
+	jsonw_name(jctx, "global_counters");
+	jsonw_start_array(jctx);
+	if (cnt->non_ip.packet_count > 0)
+		print_protocounters_json(jctx, "NON-IP", &cnt->non_ip);
+	for (proto = 0; proto < GLOBCOUNT_N_IPPROTS; proto++) {
+		if (cnt->ip_protos[proto].packet_count > 0)
+			print_protocounters_json(jctx, proto_to_str(proto),
+						 &cnt->ip_protos[proto]);
+	}
+
+	jsonw_end_array(jctx);
+	jsonw_end_object(jctx);
+}
+
+static void print_globalcounters(struct output_context *out_ctx,
+				 __u64 t_monotonic,
+				 const struct global_packet_counters *cnt)
+{
+	if (out_ctx->format == PPING_OUTPUT_STANDARD)
+		print_globalcounters_standard(out_ctx->stream, t_monotonic,
+					      cnt);
+	else if (out_ctx->jctx)
+		print_globalcounters_json(out_ctx->jctx, t_monotonic, cnt);
+}
+
+static void
+merge_percpu_globalcounters(struct global_packet_counters *merged,
+			    const struct global_packet_counters *percpu,
+			    int n_cpus)
+{
+	int cpu, i;
+
+	memset(merged, 0, sizeof(*merged));
+
+	for (cpu = 0; cpu < n_cpus; cpu++) {
+		add_packetcounters(&merged->non_ip, &percpu[cpu].non_ip);
+
+		for (i = 0; i < GLOBCOUNT_N_IPPROTS; i++)
+			add_packetcounters(&merged->ip_protos[i],
+					   &percpu[cpu].ip_protos[i]);
+	}
+}
+
+static void diff_globalcounters(struct global_packet_counters *diff,
+				const struct global_packet_counters *prev,
+				const struct global_packet_counters *next)
+{
+	int proto;
+
+	diff->non_ip.packet_count =
+		next->non_ip.packet_count - prev->non_ip.packet_count;
+	diff->non_ip.byte_count =
+		next->non_ip.byte_count - prev->non_ip.byte_count;
+
+	for (proto = 0; proto < GLOBCOUNT_N_IPPROTS; proto++) {
+		diff->ip_protos[proto].packet_count =
+			next->ip_protos[proto].packet_count -
+			prev->ip_protos[proto].packet_count;
+		diff->ip_protos[proto].byte_count =
+			next->ip_protos[proto].byte_count -
+			prev->ip_protos[proto].byte_count;
+	}
+}
+
+static int report_globalcounters(struct output_context *out_ctx, int map_fd)
+{
+	static struct global_packet_counters prev_cnt = { 0 };
+	struct global_packet_counters tot_cnt, diff;
+	struct global_packet_counters *cpu_cnt;
+	int n_cpus = libbpf_num_possible_cpus();
+	__u64 t = get_time_ns(CLOCK_MONOTONIC);
+	__u32 key = 0;
+	int err;
+
+	cpu_cnt = calloc(n_cpus, sizeof(*cpu_cnt));
+	if (!cpu_cnt)
+		return -errno;
+
+	err = bpf_map_lookup_elem(map_fd, &key, cpu_cnt);
+	if (err)
+		goto exit;
+
+	merge_percpu_globalcounters(&tot_cnt, cpu_cnt, n_cpus);
+	diff_globalcounters(&diff, &prev_cnt, &tot_cnt);
+	prev_cnt = tot_cnt;
+
+	print_globalcounters(out_ctx, t, &diff);
+
+exit:
+	free(cpu_cnt);
+	return err;
+}
+
 /*
  * Sets only the necessary programs in the object file to autoload.
  *
@@ -2055,6 +2230,59 @@ static int handle_aggregation_timer(int timer_fd,
 	return 0;
 }
 
+static int init_globalcount_timer(const struct bpf_object *obj,
+				  struct pping_config *config)
+{
+	int map_fd, timer_fd;
+	map_fd = bpf_object__find_map_fd_by_name(obj, config->globcnt_map);
+	if (map_fd < 0) {
+		fprintf(stderr, "Failed getting global counter map %s: %s\n",
+			config->globcnt_map, get_libbpf_strerror(map_fd));
+		return map_fd;
+	}
+
+	timer_fd =
+		setup_timer(config->globcnt_interval, config->globcnt_interval);
+	if (timer_fd < 0) {
+		fprintf(stderr,
+			"Failed creating timer for periodic fetching of global counters: %s\n",
+			get_libbpf_strerror(timer_fd));
+		return timer_fd;
+	}
+
+	config->globcnt_map_fd = map_fd;
+	return timer_fd;
+}
+
+static int handle_globalcount_timer(int timer_fd,
+				    struct output_context *out_ctx,
+				    int globmap_fd)
+{
+	__u64 timer_exps;
+	int ret, err;
+
+	ret = read(timer_fd, &timer_exps, sizeof(timer_exps));
+	if (ret != sizeof(timer_exps)) {
+		fprintf(stderr, "Failed reading timerfd\n");
+		return -EBADFD;
+	}
+
+	if (timer_exps > 1) {
+		fprintf(stderr,
+			"Warning - missed %llu global counting timer expirations\n",
+			timer_exps - 1);
+	}
+
+	err = report_globalcounters(out_ctx, globmap_fd);
+	if (err) {
+		fprintf(stderr, "Failed reporting global counters: %s\n",
+			get_libbpf_strerror(err));
+		return err;
+	}
+
+	return 0;
+}
+
 static int epoll_add_event_type(int epfd, int fd, __u64 event_type, __u64 value)
 {
 	struct epoll_event ev = {
@@ -2088,7 +2316,7 @@ static int epoll_add_perf_buffer(int epfd, struct perf_buffer *pb)
 }
 
 static int epoll_add_events(int epfd, struct perf_buffer *pb, int sigfd,
-			    int pipe_rfd, int aggfd)
+			    int pipe_rfd, int aggfd, int globfd)
 {
 	int err;
 
@@ -2127,6 +2355,17 @@ static int epoll_add_events(int epfd, struct perf_buffer *pb, int sigfd,
 		}
 	}
 
+	if (globfd >= 0) {
+		err = epoll_add_event_type(
+			epfd, globfd, PPING_EPEVENT_TYPE_GLOBCNTTIMER, globfd);
+		if (err) {
+			fprintf(stderr,
+				"Failed adding global counting timerfd to epoll instance: %s\n",
+				get_libbpf_strerror(err));
+			return err;
+		}
+	}
+
 	return 0;
 }
 
@@ -2154,6 +2393,11 @@ static int epoll_poll_events(int epfd, struct pping_config *config,
 				events[i].data.u64 & PPING_EPEVENT_MASK,
 				config->out_ctx, &config->agg_maps,
 				&config->agg_conf);
+			break;
+		case PPING_EPEVENT_TYPE_GLOBCNTTIMER:
+			err = handle_globalcount_timer(
+				events[i].data.u64 & PPING_EPEVENT_MASK,
+				config->out_ctx, config->globcnt_map_fd);
 			break;
 		case PPING_EPEVENT_TYPE_SIGNAL:
 			err = handle_signalfd(
@@ -2186,7 +2430,7 @@ int main(int argc, char *argv[])
 	void *thread_err;
 	struct bpf_object *obj = NULL;
 	struct perf_buffer *pb = NULL;
-	int epfd, sigfd, aggfd;
+	int epfd, sigfd, aggfd, globfd;
 
 	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts);
 	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts);
@@ -2211,6 +2455,7 @@ int main(int argc, char *argv[])
 		.packet_map = "packet_ts",
 		.flow_map = "flow_state",
 		.event_map = "events",
+		.globcnt_map = "map_global_counters",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
 		.xdp_mode = XDP_MODE_NATIVE,
@@ -2245,6 +2490,11 @@ int main(int argc, char *argv[])
 		if (config.bpf_config.agg_rtts) {
 			fprintf(stderr,
 				"The ppviz format does not support aggregated output\n");
+			return EXIT_FAILURE;
+		}
+		if (config.bpf_config.global_counters) {
+			fprintf(stderr,
+				"The ppviz format does not support global counters\n");
 			return EXIT_FAILURE;
 		}
 		if (config.bpf_config.track_icmp)
@@ -2309,14 +2559,27 @@ int main(int argc, char *argv[])
 		aggfd = -1;
 	}
 
+	if (config.bpf_config.global_counters) {
+		globfd = init_globalcount_timer(obj, &config);
+		if (globfd < 0) {
+			fprintf(stderr,
+				"Failed setting up global counting timer: %s\n",
+				get_libbpf_strerror(globfd));
+			goto cleanup_aggfd;
+		}
+	} else {
+		globfd = -1;
+	}
+
 	epfd = epoll_create1(EPOLL_CLOEXEC);
 	if (epfd < 0) {
 		fprintf(stderr, "Failed creating epoll instance: %s\n",
 			get_libbpf_strerror(err));
-		goto cleanup_aggfd;
+		goto cleanup_globfd;
 	}
 
-	err = epoll_add_events(epfd, pb, sigfd, config.clean_args.pipe_rfd, aggfd);
+	err = epoll_add_events(epfd, pb, sigfd, config.clean_args.pipe_rfd,
+			       aggfd, globfd);
 	if (err) {
 		fprintf(stderr, "Failed adding events to epoll instace: %s\n",
 			get_libbpf_strerror(err));
@@ -2339,6 +2602,10 @@ int main(int argc, char *argv[])
 	// Cleanup
 cleanup_epfd:
 	close(epfd);
+
+cleanup_globfd:
+	if (globfd > 0)
+		close(globfd);
 
 cleanup_aggfd:
 	if (aggfd >= 0)

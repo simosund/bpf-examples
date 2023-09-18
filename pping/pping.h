@@ -34,6 +34,8 @@ typedef __u64 fixpoint64;
 #define TX_IDX 0
 #define RX_IDX 1
 
+#define GLOBCOUNT_N_IPPROTS 256
+
 /* Special IPv4/IPv6 prefixes used for backup entries
  * To avoid them colliding with and actual traffic (causing the traffic to end
  * up in the backup entry), use prefixes from blocks reserved for documentation.
@@ -105,6 +107,7 @@ struct bpf_config {
 	bool push_individual_events;
 	bool agg_rtts;
 	bool agg_by_dst; // dst of reply packet
+	bool global_counters;
 };
 
 struct ipprefix_key {
@@ -270,6 +273,11 @@ struct aggregated_stats {
 	__u64 rtt_min;
 	__u64 rtt_max;
 	__u32 rtt_bins[RTT_AGG_NR_BINS];
+};
+
+struct global_packet_counters {
+	struct packet_counters non_ip;
+	struct packet_counters ip_protos[GLOBCOUNT_N_IPPROTS];
 };
 
 #endif
