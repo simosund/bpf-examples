@@ -127,6 +127,7 @@ char _license[] SEC("license") = "GPL";
 // Global config struct - set from userspace
 static volatile const struct bpf_config config = {};
 static volatile __u64 last_warn_time[2] = { 0 };
+static volatile __u64 iter_map_start[PPING_MAP_N_MAPS];
 
 // Keep an empty aggregated_stats as a global variable to use as a template
 // when creating new entries. That way, it won't have to be allocated on stack
@@ -203,6 +204,13 @@ struct {
 	__type(value, struct global_packet_counters);
 	__uint(max_entries, 1);
 } map_global_counters SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct map_util_stats);
+	__uint(max_entries, 2);
+} map_maputil_stats SEC(".maps");
 
 // Help functions
 
@@ -801,6 +809,23 @@ static void send_rtt_event(void *ctx, __u64 rtt, struct flow_state *f_state,
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &re, sizeof(re));
 }
 
+static void update_map_util(enum pping_map map, enum pping_maputil_field field,
+			    __u64 value)
+{
+	if (!config.map_util_stats)
+		return;
+
+	struct map_util_stats *stats;
+	__u32 key = map;
+
+
+	stats = bpf_map_lookup_elem(&map_maputil_stats, &key);
+	if (!stats)
+		return;
+
+	stats->fields[field] += value;
+}
+
 /*
  * Initilizes an "empty" flow state based on the forward direction of the
  * current packet
@@ -841,16 +866,18 @@ static void init_dualflow_state(struct dual_flow_state *df_state,
 	init_empty_flowstate(rev_state);
 }
 
-static struct dual_flow_state *
-create_dualflow_state(void *ctx, struct packet_info *p_info)
+static struct dual_flow_state *create_dualflow_state(void *ctx,
+						     struct packet_info *p_info)
 {
 	struct network_tuple *key = get_dualflow_key_from_packet(p_info);
 	struct dual_flow_state new_state = { 0 };
 
 	init_dualflow_state(&new_state, p_info);
 
-	if (bpf_map_update_elem(&flow_state, key, &new_state, BPF_NOEXIST) !=
+	if (bpf_map_update_elem(&flow_state, key, &new_state, BPF_NOEXIST) ==
 	    0) {
+		update_map_util(PPING_MAP_FLOWSTATE, PPING_MAPUTIL_CREATED, 1);
+	} else {
 		send_map_full_event(ctx, p_info, PPING_MAP_FLOWSTATE);
 		return NULL;
 	}
@@ -941,8 +968,11 @@ static void close_and_delete_flows(void *ctx, struct packet_info *p_info,
 	if (!is_flowstate_active(fw_flow) && !is_flowstate_active(rev_flow)) {
 		if (bpf_map_delete_elem(&flow_state,
 					get_dualflow_key_from_packet(p_info)) ==
-		    0)
+		    0) {
+			update_map_util(PPING_MAP_FLOWSTATE,
+					PPING_MAPUTIL_SELFDEL, 1);
 			debug_increment_autodel(PPING_MAP_FLOWSTATE);
+		}
 	}
 }
 
@@ -1106,10 +1136,12 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 	f_state->last_timestamp = p_info->time;
 
 	if (bpf_map_update_elem(&packet_ts, &p_info->pid, &p_info->time,
-				BPF_NOEXIST) == 0)
+				BPF_NOEXIST) == 0) {
 		__sync_fetch_and_add(&f_state->outstanding_timestamps, 1);
-	else
+		update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_CREATED, 1);
+	} else {
 		send_map_full_event(ctx, p_info, PPING_MAP_PACKETTS);
+	}
 }
 
 /*
@@ -1137,6 +1169,7 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	// Delete timestamp entry as soon as RTT is calculated
 	if (bpf_map_delete_elem(&packet_ts, &p_info->reply_pid) == 0) {
 		__sync_fetch_and_add(&f_state->outstanding_timestamps, -1);
+		update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_SELFDEL, 1);
 		debug_increment_autodel(PPING_MAP_PACKETTS);
 	}
 
@@ -1338,6 +1371,35 @@ static void send_flow_timeout_message(void *ctx, struct network_tuple *flow,
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &fe, sizeof(fe));
 }
 
+static void mapiter_update_maputil_stats(enum pping_map map, __u64 seq,
+					 bool finished, __u64 time)
+{
+	/* The map iteration always seems to end with a final "empty" iteration
+	   (no key/value), i.e. the "finished" round. This final round seems to
+	   reuse the sequence number of the last "non-empty" iteration, and will
+	   thus have the sequence number 0 both if it iterated through 0 or 1
+	   actual map elements. So only set start time on first map-element
+	   iteration, and use set/unset start time to determine if any map
+	   elements have been iterated through when we reach the "finished"
+	   round.
+	*/
+
+	__u64 t;
+
+	if (finished) {
+		update_map_util(map, PPING_MAPUTIL_CLEANCYCLES, 1);
+
+		t = iter_map_start[map]; // seems to please the verifier
+		if (t > 0) {
+			update_map_util(map, PPING_MAPUTIL_CLEANNPROC, seq + 1);
+			update_map_util(map, PPING_MAPUTIL_CLEANTIME, time - t);
+			iter_map_start[map] = 0;
+		}
+	} else if (seq == 0) {
+		iter_map_start[map] = time;
+	}
+}
+
 // Programs
 
 // Egress path using TC-BPF
@@ -1382,6 +1444,8 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	debug_update_mapclean_stats(ctx, &events, !ctx->key || !ctx->value,
 				    ctx->meta->seq_num, now,
 				    PPING_MAP_PACKETTS);
+	mapiter_update_maputil_stats(PPING_MAP_PACKETTS, ctx->meta->seq_num,
+				     !ctx->key || !ctx->value, now);
 
 	if (!pid || !timestamp)
 		return 0;
@@ -1401,6 +1465,7 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 		__builtin_memcpy(&local_pid, pid, sizeof(local_pid));
 		if (bpf_map_delete_elem(&packet_ts, &local_pid) == 0) {
 			debug_increment_timeoutdel(PPING_MAP_PACKETTS);
+			update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_EXPIRED, 1);
 
 			if (f_state)
 				__sync_fetch_and_add(
@@ -1423,6 +1488,8 @@ int flowmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	debug_update_mapclean_stats(ctx, &events, !ctx->key || !ctx->value,
 				    ctx->meta->seq_num, now,
 				    PPING_MAP_FLOWSTATE);
+	mapiter_update_maputil_stats(PPING_MAP_FLOWSTATE, ctx->meta->seq_num,
+				     !ctx->key || !ctx->value, now);
 
 	if (!ctx->key || !ctx->value)
 		return 0;
@@ -1444,6 +1511,7 @@ int flowmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 		notify2 = should_notify_closing(f_state2) && timeout2;
 		if (bpf_map_delete_elem(&flow_state, &flow1) == 0) {
 			debug_increment_timeoutdel(PPING_MAP_FLOWSTATE);
+			update_map_util(PPING_MAP_FLOWSTATE, PPING_MAPUTIL_EXPIRED, 1);
 			if (notify1)
 				send_flow_timeout_message(ctx, &flow1, now);
 			if (notify2)
