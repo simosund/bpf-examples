@@ -56,10 +56,11 @@ static const char *__doc__ =
 #define PPING_EPEVENT_TYPE_PIPE (1ULL << 61)
 #define PPING_EPEVENT_TYPE_AGGTIMER (1ULL << 60)
 #define PPING_EPEVENT_TYPE_GLOBCNTTIMER (1ULL << 59)
+#define PPING_EPEVENT_TYPE_MAPUTILTIMER (1ULL << 58)
 #define PPING_EPEVENT_MASK                                                     \
 	(~(PPING_EPEVENT_TYPE_PERFBUF | PPING_EPEVENT_TYPE_SIGNAL |            \
 	   PPING_EPEVENT_TYPE_PIPE | PPING_EPEVENT_TYPE_AGGTIMER |             \
-	   PPING_EPEVENT_TYPE_GLOBCNTTIMER))
+	   PPING_EPEVENT_TYPE_GLOBCNTTIMER | PPING_EPEVENT_TYPE_MAPUTILTIMER))
 
 #define AGG_BATCH_SIZE 64 // Batch size for fetching aggregation maps (bpf_map_lookup_batch)
 
@@ -71,6 +72,7 @@ static const char *__doc__ =
 
 #define ARG_AGG_REVERSE 256
 #define AGG_ARG_TIMEOUT 257
+#define ARG_MAP_STATS   258
 
 enum pping_output_format {
 	PPING_OUTPUT_STANDARD,
@@ -125,6 +127,17 @@ struct aggregation_maps {
 	int map_v6_fd[2];
 };
 
+struct extended_maputil_stats {
+	__u64 n_entries;
+	struct map_util_stats base_stats;
+};
+
+struct map_util_context {
+	struct map_util_stats prev_stats[PPING_MAP_N_MAPS];
+	__u64 interval;
+	int map_fd;
+};
+
 // Store configuration values in struct to easily pass around
 struct pping_config {
 	struct bpf_config bpf_config;
@@ -134,6 +147,7 @@ struct pping_config {
 	struct aggregation_config agg_conf;
 	struct aggregation_maps agg_maps;
 	struct output_context *out_ctx;
+	struct map_util_context maputil_ctx;
 	char *object_path;
 	char *ingress_prog;
 	char *egress_prog;
@@ -143,6 +157,7 @@ struct pping_config {
 	char *flow_map;
 	char *event_map;
 	char *globcnt_map;
+	char *mapstats_map;
 	__u64 globcnt_interval;
 	int globcnt_map_fd;
 	int ifindex;
@@ -180,6 +195,7 @@ static const struct option long_options[] = {
 	{ "aggregate-timeout",    required_argument, NULL, AGG_ARG_TIMEOUT }, // Interval for timing out subnet entries in seconds (default 30s)
 	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
 	{ "global-counters",      required_argument, NULL, 'g' }, // Output global packets counters every X seconds
+	{ "map-stats",            required_argument, NULL,  ARG_MAP_STATS }, // Output map utilization statistics every X seconds
 	{ 0, 0, NULL, 0 }
 };
 
@@ -289,6 +305,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 	config->bpf_config.global_counters = false;
+	config->bpf_config.map_util_stats = false;
 
 	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:4:6:w:g:",
 				  long_options, NULL)) != -1) {
@@ -461,6 +478,16 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 
 			config->globcnt_interval = user_int * NS_PER_SECOND;
 			config->bpf_config.global_counters = true;
+			break;
+		case ARG_MAP_STATS:
+			err = parse_bounded_long(&user_int, optarg, 1,
+						 7 * S_PER_DAY,
+						 "map-stats");
+			if (err)
+				return -EINVAL;
+
+			config->maputil_ctx.interval = user_int * NS_PER_SECOND;
+			config->bpf_config.map_util_stats = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -1722,14 +1749,181 @@ exit:
 	return err;
 }
 
+static void add_maputil_stats(struct map_util_stats *to,
+			      const struct map_util_stats *from)
+{
+	int field;
+
+	for (field = 0; field < PPING_MAPUTIL_N_FIELDS; field++)
+		to->fields[field] += from->fields[field];
+}
+
+static void merge_percpu_maputil_stats(struct map_util_stats *merged,
+				       const struct map_util_stats *percpu,
+				       int n_cpus)
+{
+	int cpu;
+
+	memset(merged, 0, sizeof(*merged));
+
+	for (cpu = 0; cpu < n_cpus; cpu++)
+		add_maputil_stats(merged, &percpu[cpu]);
+}
+
+static void compute_extended_maputil_stats(struct extended_maputil_stats *dst,
+					   struct map_util_stats *total,
+					   struct map_util_stats *prev)
+{
+	int field;
+
+	// Current entries is simply diff in total created vs total deleted
+	dst->n_entries = total->fields[PPING_MAPUTIL_CREATED] -
+			 (total->fields[PPING_MAPUTIL_SELFDEL] +
+			  total->fields[PPING_MAPUTIL_EXPIRED]);
+
+	// Remaining stats are diff since previous
+	for (field = 0; field < PPING_MAPUTIL_N_FIELDS; field++)
+		dst->base_stats.fields[field] =
+			total->fields[field] - prev->fields[field];
+}
+
+static const char *ppingmap_to_str(enum pping_map map)
+{
+	return map == PPING_MAP_FLOWSTATE ? "flow-state" : "packet-timestamps";
+}
+
+static void print_maputil_standard(FILE *stream, __u64 t_monotonic,
+				   enum pping_map map,
+				   const struct extended_maputil_stats *stats)
+{
+	print_ns_datetime(stream, t_monotonic);
+	fprintf(stream,
+		": %s: entries=%llu, created=%llu, deleted=%llu, expired=%llu, clean-cycles=%llu, clean-proc=%llu, clean-time=%.3f ms\n",
+		ppingmap_to_str(map), stats->n_entries,
+		stats->base_stats.fields[PPING_MAPUTIL_CREATED],
+		stats->base_stats.fields[PPING_MAPUTIL_SELFDEL],
+		stats->base_stats.fields[PPING_MAPUTIL_EXPIRED],
+		stats->base_stats.fields[PPING_MAPUTIL_CLEANCYCLES],
+		stats->base_stats.fields[PPING_MAPUTIL_CLEANNPROC],
+		(double)stats->base_stats.fields[PPING_MAPUTIL_CLEANTIME] /
+			NS_PER_MS);
+}
+
+static void print_maputil_json(json_writer_t *jctx, __u64 t_monotonic,
+			       enum pping_map map,
+			       const struct extended_maputil_stats *stats)
+{
+	jsonw_start_object(jctx);
+
+	jsonw_u64_field(jctx, "timestamp",
+			convert_monotonic_to_realtime(t_monotonic));
+	jsonw_string_field(jctx, "map", ppingmap_to_str(map));
+	jsonw_u64_field(jctx, "entries", stats->n_entries);
+	jsonw_u64_field(jctx, "created",
+			stats->base_stats.fields[PPING_MAPUTIL_CREATED]);
+	jsonw_u64_field(jctx, "deleted",
+			stats->base_stats.fields[PPING_MAPUTIL_SELFDEL]);
+	jsonw_u64_field(jctx, "expired",
+			stats->base_stats.fields[PPING_MAPUTIL_EXPIRED]);
+	jsonw_u64_field(jctx, "clean-cyles",
+			stats->base_stats.fields[PPING_MAPUTIL_CLEANCYCLES]);
+	jsonw_u64_field(jctx, "clean-processed",
+			stats->base_stats.fields[PPING_MAPUTIL_CLEANNPROC]);
+	jsonw_u64_field(jctx, "clean-time",
+			stats->base_stats.fields[PPING_MAPUTIL_CLEANTIME]);
+
+	jsonw_end_object(jctx);
+}
+
+static void print_maputil(struct output_context *out_ctx, __u64 t_monotonic,
+			  enum pping_map map,
+			  const struct extended_maputil_stats *stats)
+{
+	if (out_ctx->format == PPING_OUTPUT_STANDARD)
+		print_maputil_standard(out_ctx->stream, t_monotonic, map,
+				       stats);
+	else if (out_ctx->jctx)
+		print_maputil_json(out_ctx->jctx, t_monotonic, map, stats);
+}
+
+static int fetch_kernel_maputil_stats(int map_fd, enum pping_map map,
+				      struct map_util_stats *stats)
+{
+	int n_cpus = libbpf_num_possible_cpus();
+	struct map_util_stats *percpu;
+	__u32 key = map;
+	int err;
+
+	percpu = calloc(n_cpus, sizeof(*percpu));
+	if (!percpu)
+		return -errno;
+
+	err = bpf_map_lookup_elem(map_fd, &key, percpu);
+	if (err)
+		goto exit;
+
+	merge_percpu_maputil_stats(stats, percpu, n_cpus);
+
+exit:
+	free(percpu);
+	return err;
+}
+
+static int get_current_maputil_stats(int map_fd, enum pping_map map,
+				     struct extended_maputil_stats *dst,
+				     struct map_util_stats *prev_stats)
+{
+	struct map_util_stats tot;
+	int err;
+
+	err = fetch_kernel_maputil_stats(map_fd, map, &tot);
+	if (err)
+		return err;
+
+	compute_extended_maputil_stats(dst, &tot, prev_stats);
+	*prev_stats = tot;
+	return 0;
+}
+
+static int report_map_maputil(struct output_context *out_ctx,
+			      struct map_util_context *maputil_ctx,
+			      enum pping_map map)
+{
+	struct extended_maputil_stats stats;
+	int err;
+	__u64 t;
+
+	t = get_time_ns(CLOCK_MONOTONIC);
+	err = get_current_maputil_stats(maputil_ctx->map_fd, map, &stats,
+					&maputil_ctx->prev_stats[map]);
+	if (err)
+		return err;
+	print_maputil(out_ctx, t, map, &stats);
+
+	return 0;
+}
+
+static int report_maputil(struct output_context *out_ctx,
+			  struct map_util_context *maputil_ctx)
+{
+	int err;
+
+	err = report_map_maputil(out_ctx, maputil_ctx, PPING_MAP_FLOWSTATE);
+	if (err)
+		return err;
+
+	err = report_map_maputil(out_ctx, maputil_ctx, PPING_MAP_PACKETTS);
+	return err;
+}
+
 /*
  * Sets only the necessary programs in the object file to autoload.
  *
  * Assumes all programs are set to autoload by default, so in practice
  * deactivates autoloading for the program that does not need to be loaded.
  */
-static int set_programs_to_load(struct bpf_object *obj,
-				struct pping_config *config)
+	static int set_programs_to_load(struct bpf_object *obj,
+					struct pping_config *config)
 {
 	struct bpf_program *prog;
 	char *unload_prog =
@@ -2283,6 +2477,62 @@ static int handle_globalcount_timer(int timer_fd,
 	return 0;
 }
 
+static int init_maputil_timer(const struct bpf_object *obj,
+			      struct pping_config *config)
+{
+	int map_fd, timer_fd;
+
+	memset(config->maputil_ctx.prev_stats, 0,
+	       sizeof(config->maputil_ctx.prev_stats));
+
+	map_fd = bpf_object__find_map_fd_by_name(obj, config->mapstats_map);
+	if (map_fd < 0) {
+		fprintf(stderr, "Failed getting map utilization map %s: %s\n",
+			config->mapstats_map, get_libbpf_strerror(map_fd));
+		return map_fd;
+	}
+
+	timer_fd = setup_timer(config->maputil_ctx.interval,
+			       config->maputil_ctx.interval);
+	if (timer_fd < 0) {
+		fprintf(stderr,
+			"Failed creating timer for periodic map utilization stats: %s\n",
+			get_libbpf_strerror(timer_fd));
+		return timer_fd;
+	}
+
+	config->maputil_ctx.map_fd = map_fd;
+	return timer_fd;
+}
+
+static int handle_maputil_timer(int timer_fd, struct output_context *out_ctx,
+				struct map_util_context *maputil_ctx)
+{
+	__u64 timer_exps;
+	int ret, err;
+
+	ret = read(timer_fd, &timer_exps, sizeof(timer_exps));
+	if (ret != sizeof(timer_exps)) {
+		fprintf(stderr, "Failed reading timerfd\n");
+		return -EBADFD;
+	}
+
+	if (timer_exps > 1) {
+		fprintf(stderr,
+			"Warning - missed %llu map utilization timer expirations\n",
+			timer_exps - 1);
+	}
+
+	err = report_maputil(out_ctx, maputil_ctx);
+	if (err) {
+		fprintf(stderr, "Failed reporting map utilization stats: %s\n",
+			get_libbpf_strerror(err));
+		return err;
+	}
+
+	return 0;
+}
+
 static int epoll_add_event_type(int epfd, int fd, __u64 event_type, __u64 value)
 {
 	struct epoll_event ev = {
@@ -2316,7 +2566,7 @@ static int epoll_add_perf_buffer(int epfd, struct perf_buffer *pb)
 }
 
 static int epoll_add_events(int epfd, struct perf_buffer *pb, int sigfd,
-			    int pipe_rfd, int aggfd, int globfd)
+			    int pipe_rfd, int aggfd, int globfd, int mapufd)
 {
 	int err;
 
@@ -2366,6 +2616,17 @@ static int epoll_add_events(int epfd, struct perf_buffer *pb, int sigfd,
 		}
 	}
 
+	if (mapufd >= 0) {
+		err = epoll_add_event_type(
+			epfd, mapufd, PPING_EPEVENT_TYPE_MAPUTILTIMER, mapufd);
+		if (err) {
+			fprintf(stderr,
+				"Failed adding map utilization timerfd to epoll instance: %s\n",
+				get_libbpf_strerror(err));
+			return err;
+		}
+	}
+
 	return 0;
 }
 
@@ -2399,6 +2660,11 @@ static int epoll_poll_events(int epfd, struct pping_config *config,
 				events[i].data.u64 & PPING_EPEVENT_MASK,
 				config->out_ctx, config->globcnt_map_fd);
 			break;
+		case PPING_EPEVENT_TYPE_MAPUTILTIMER:
+			err = handle_maputil_timer(
+				events[i].data.u64 & PPING_EPEVENT_MASK,
+				config->out_ctx, &config->maputil_ctx);
+			break;
 		case PPING_EPEVENT_TYPE_SIGNAL:
 			err = handle_signalfd(
 				events[i].data.u64 & PPING_EPEVENT_MASK,
@@ -2430,7 +2696,7 @@ int main(int argc, char *argv[])
 	void *thread_err;
 	struct bpf_object *obj = NULL;
 	struct perf_buffer *pb = NULL;
-	int epfd, sigfd, aggfd, globfd;
+	int epfd, sigfd, aggfd, globfd, mapufd;
 
 	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts);
 	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts);
@@ -2456,6 +2722,7 @@ int main(int argc, char *argv[])
 		.flow_map = "flow_state",
 		.event_map = "events",
 		.globcnt_map = "map_global_counters",
+		.mapstats_map = "map_maputil_stats",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
 		.xdp_mode = XDP_MODE_NATIVE,
@@ -2495,6 +2762,11 @@ int main(int argc, char *argv[])
 		if (config.bpf_config.global_counters) {
 			fprintf(stderr,
 				"The ppviz format does not support global counters\n");
+			return EXIT_FAILURE;
+		}
+		if (config.bpf_config.map_util_stats) {
+			fprintf(stderr,
+				"The ppviz format does not support map utilization output\n");
 			return EXIT_FAILURE;
 		}
 		if (config.bpf_config.track_icmp)
@@ -2571,15 +2843,27 @@ int main(int argc, char *argv[])
 		globfd = -1;
 	}
 
+	if (config.bpf_config.map_util_stats) {
+		mapufd = init_maputil_timer(obj, &config);
+		if (mapufd < 0) {
+			fprintf(stderr,
+				"Failed setting up map utilization timer: %s\n",
+				get_libbpf_strerror(mapufd));
+			goto cleanup_globfd;
+		}
+	} else {
+		mapufd = -1;
+	}
+
 	epfd = epoll_create1(EPOLL_CLOEXEC);
 	if (epfd < 0) {
 		fprintf(stderr, "Failed creating epoll instance: %s\n",
 			get_libbpf_strerror(err));
-		goto cleanup_globfd;
+		goto cleanup_mapufd;
 	}
 
 	err = epoll_add_events(epfd, pb, sigfd, config.clean_args.pipe_rfd,
-			       aggfd, globfd);
+			       aggfd, globfd, mapufd);
 	if (err) {
 		fprintf(stderr, "Failed adding events to epoll instace: %s\n",
 			get_libbpf_strerror(err));
@@ -2602,6 +2886,10 @@ int main(int argc, char *argv[])
 	// Cleanup
 cleanup_epfd:
 	close(epfd);
+
+cleanup_mapufd:
+	if (mapufd >= 0)
+		close(mapufd);
 
 cleanup_globfd:
 	if (globfd > 0)

@@ -77,14 +77,26 @@ enum __attribute__((__packed__)) flow_event_source {
 
 enum __attribute__((__packed__)) pping_map {
 	PPING_MAP_FLOWSTATE = 0,
-	PPING_MAP_PACKETTS
+	PPING_MAP_PACKETTS,
+	PPING_MAP_N_MAPS
+};
+
+/* Fields in the map_util_stats struct */
+enum pping_maputil_field {
+	PPING_MAPUTIL_CREATED = 0,
+	PPING_MAPUTIL_SELFDEL,
+	PPING_MAPUTIL_EXPIRED,
+	PPING_MAPUTIL_CLEANCYCLES,
+	PPING_MAPUTIL_CLEANNPROC,
+	PPING_MAPUTIL_CLEANTIME,
+	PPING_MAPUTIL_N_FIELDS // Number of fields, not a valid field itself
 };
 
 enum __attribute__((__packed__)) connection_state {
-        CONNECTION_STATE_EMPTY,
-        CONNECTION_STATE_WAITOPEN,
-        CONNECTION_STATE_OPEN,
-        CONNECTION_STATE_CLOSED
+	CONNECTION_STATE_EMPTY,
+	CONNECTION_STATE_WAITOPEN,
+	CONNECTION_STATE_OPEN,
+	CONNECTION_STATE_CLOSED
 };
 
 enum agg_pktcnt_group {
@@ -108,6 +120,7 @@ struct bpf_config {
 	bool agg_rtts;
 	bool agg_by_dst; // dst of reply packet
 	bool global_counters;
+	bool map_util_stats;
 };
 
 struct ipprefix_key {
@@ -278,6 +291,10 @@ struct aggregated_stats {
 struct global_packet_counters {
 	struct packet_counters non_ip;
 	struct packet_counters ip_protos[GLOBCOUNT_N_IPPROTS];
+};
+
+struct map_util_stats {
+	__u64 fields[PPING_MAPUTIL_N_FIELDS]; // Fields corresponding to pping_maputil_field enum
 };
 
 #endif
