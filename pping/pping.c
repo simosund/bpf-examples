@@ -2347,8 +2347,27 @@ static int setup_timer(__u64 init_delay_ns, __u64 interval_ns)
 	return fd;
 }
 
-static int init_aggregation_timer(struct bpf_object *obj,
-				  struct pping_config *config)
+static int read_timer(int timer_fd, const char *timer_name)
+{
+	__u64 timer_exps;
+	int ret;
+
+	ret = read(timer_fd, &timer_exps, sizeof(timer_exps));
+	if (ret != sizeof(timer_exps)) {
+		fprintf(stderr, "Failed reading %s timerfd\n", timer_name);
+		return -EBADFD;
+	}
+
+	if (timer_exps > 1) {
+		fprintf(stderr, "Warning - missed %llu %s timer expirations\n",
+			timer_exps - 1, timer_name);
+	}
+
+	return 0;
+}
+
+static int init_aggregation_reporting(struct bpf_object *obj,
+				      struct pping_config *config)
 {
 	int err, fd;
 
@@ -2386,20 +2405,11 @@ static int handle_aggregation_timer(int timer_fd,
 				    struct aggregation_maps *maps,
 				    struct aggregation_config *agg_conf)
 {
-	__u64 timer_exps;
-	int ret, err;
+	int err;
 
-	ret = read(timer_fd, &timer_exps, sizeof(timer_exps));
-	if (ret != sizeof(timer_exps)) {
-		fprintf(stderr, "Failed reading timerfd\n");
-		return -EBADFD;
-	}
-
-	if (timer_exps > 1) {
-		fprintf(stderr,
-			"Warning - missed %llu aggregation timer expirations\n",
-			timer_exps - 1);
-	}
+	err = read_timer(timer_fd, "aggregation");
+	if (err)
+		return err;
 
 	err = report_aggregated_rtts(out_ctx, maps, agg_conf);
 	if (err) {
@@ -2411,8 +2421,8 @@ static int handle_aggregation_timer(int timer_fd,
 	return 0;
 }
 
-static int init_globalcount_timer(const struct bpf_object *obj,
-				  struct pping_config *config)
+static int init_globalcount_reporting(const struct bpf_object *obj,
+				      struct pping_config *config)
 {
 	int map_fd, timer_fd;
 	map_fd = bpf_object__find_map_fd_by_name(obj, config->globcnt_map);
@@ -2439,20 +2449,11 @@ static int handle_globalcount_timer(int timer_fd,
 				    struct output_context *out_ctx,
 				    int globmap_fd)
 {
-	__u64 timer_exps;
-	int ret, err;
+	int err;
 
-	ret = read(timer_fd, &timer_exps, sizeof(timer_exps));
-	if (ret != sizeof(timer_exps)) {
-		fprintf(stderr, "Failed reading timerfd\n");
-		return -EBADFD;
-	}
-
-	if (timer_exps > 1) {
-		fprintf(stderr,
-			"Warning - missed %llu global counting timer expirations\n",
-			timer_exps - 1);
-	}
+	err = read_timer(timer_fd, "global counting");
+	if (err)
+		return err;
 
 	err = report_globalcounters(out_ctx, globmap_fd);
 	if (err) {
@@ -2464,8 +2465,8 @@ static int handle_globalcount_timer(int timer_fd,
 	return 0;
 }
 
-static int init_maputil_timer(const struct bpf_object *obj,
-			      struct pping_config *config)
+static int init_maputil_reporting(const struct bpf_object *obj,
+				  struct pping_config *config)
 {
 	int map_fd, timer_fd;
 
@@ -2495,20 +2496,11 @@ static int init_maputil_timer(const struct bpf_object *obj,
 static int handle_maputil_timer(int timer_fd, struct output_context *out_ctx,
 				struct map_util_context *maputil_ctx)
 {
-	__u64 timer_exps;
-	int ret, err;
+	int err;
 
-	ret = read(timer_fd, &timer_exps, sizeof(timer_exps));
-	if (ret != sizeof(timer_exps)) {
-		fprintf(stderr, "Failed reading timerfd\n");
-		return -EBADFD;
-	}
-
-	if (timer_exps > 1) {
-		fprintf(stderr,
-			"Warning - missed %llu map utilization timer expirations\n",
-			timer_exps - 1);
-	}
+	err = read_timer(timer_fd, "map utilization");
+	if (err)
+		return err;
 
 	err = report_maputil(out_ctx, maputil_ctx);
 	if (err) {
@@ -2555,7 +2547,20 @@ static int epoll_add_perf_buffer(int epfd, struct perf_buffer *pb)
 static int epoll_add_events(int epfd, struct perf_buffer *pb, int sigfd,
 			    int pipe_rfd, int aggfd, int globfd, int mapufd)
 {
-	int err;
+	struct {
+		__u64 timer_type;
+		const char *name;
+		int timerfd;
+	} timers[] = { { .timerfd = aggfd,
+			 .timer_type = PPING_EPEVENT_TYPE_AGGTIMER,
+			 .name = "aggregation" },
+		       { .timerfd = globfd,
+			 .timer_type = PPING_EPEVENT_TYPE_GLOBCNTTIMER,
+			 .name = "global counting" },
+		       { .timerfd = mapufd,
+			 .timer_type = PPING_EPEVENT_TYPE_MAPUTILTIMER,
+			 .name = "map utilization" } };
+	int i, err;
 
 	err = epoll_add_event_type(epfd, sigfd, PPING_EPEVENT_TYPE_SIGNAL,
 				   sigfd);
@@ -2581,36 +2586,18 @@ static int epoll_add_events(int epfd, struct perf_buffer *pb, int sigfd,
 		return err;
 	}
 
-	if (aggfd >= 0) {
-		err = epoll_add_event_type(epfd, aggfd,
-					   PPING_EPEVENT_TYPE_AGGTIMER, aggfd);
-		if (err) {
-			fprintf(stderr,
-				"Failed adding aggregation timerfd to epoll instance: %s\n",
-				get_libbpf_strerror(err));
-			return err;
-		}
-	}
-
-	if (globfd >= 0) {
-		err = epoll_add_event_type(
-			epfd, globfd, PPING_EPEVENT_TYPE_GLOBCNTTIMER, globfd);
-		if (err) {
-			fprintf(stderr,
-				"Failed adding global counting timerfd to epoll instance: %s\n",
-				get_libbpf_strerror(err));
-			return err;
-		}
-	}
-
-	if (mapufd >= 0) {
-		err = epoll_add_event_type(
-			epfd, mapufd, PPING_EPEVENT_TYPE_MAPUTILTIMER, mapufd);
-		if (err) {
-			fprintf(stderr,
-				"Failed adding map utilization timerfd to epoll instance: %s\n",
-				get_libbpf_strerror(err));
-			return err;
+	for (i = 0; i < sizeof(timers) / sizeof(timers[0]); i++) {
+		if (timers[i].timerfd >= 0) {
+			err = epoll_add_event_type(epfd, timers[i].timerfd,
+						   timers[i].timer_type,
+						   timers[i].timerfd);
+			if (err) {
+				fprintf(stderr,
+					"Failed adding %s timerfd to epoll instance: %s\n",
+					timers[i].name,
+					get_libbpf_strerror(err));
+				return err;
+			}
 		}
 	}
 
@@ -2683,7 +2670,8 @@ int main(int argc, char *argv[])
 	void *thread_err;
 	struct bpf_object *obj = NULL;
 	struct perf_buffer *pb = NULL;
-	int epfd, sigfd, aggfd, globfd, mapufd;
+	int epfd, sigfd;
+	int aggfd = -1, globfd = -1, mapufd = -1;
 
 	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts);
 	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts);
@@ -2807,39 +2795,33 @@ int main(int argc, char *argv[])
 	}
 
 	if (config.bpf_config.agg_rtts) {
-		aggfd = init_aggregation_timer(obj, &config);
+		aggfd = init_aggregation_reporting(obj, &config);
 		if (aggfd < 0) {
 			fprintf(stderr,
-				"Failed setting up aggregation timerfd: %s\n",
+				"Failed setting up aggregation reporting: %s\n",
 				get_libbpf_strerror(aggfd));
 			goto cleanup_perf_buffer;
 		}
-	} else {
-		aggfd = -1;
 	}
 
 	if (config.bpf_config.global_counters) {
-		globfd = init_globalcount_timer(obj, &config);
+		globfd = init_globalcount_reporting(obj, &config);
 		if (globfd < 0) {
 			fprintf(stderr,
-				"Failed setting up global counting timer: %s\n",
+				"Failed setting up global counting reporting: %s\n",
 				get_libbpf_strerror(globfd));
 			goto cleanup_aggfd;
 		}
-	} else {
-		globfd = -1;
 	}
 
 	if (config.bpf_config.map_util_stats) {
-		mapufd = init_maputil_timer(obj, &config);
+		mapufd = init_maputil_reporting(obj, &config);
 		if (mapufd < 0) {
 			fprintf(stderr,
-				"Failed setting up map utilization timer: %s\n",
+				"Failed setting up map utilization reporting: %s\n",
 				get_libbpf_strerror(mapufd));
 			goto cleanup_globfd;
 		}
-	} else {
-		mapufd = -1;
 	}
 
 	epfd = epoll_create1(EPOLL_CLOEXEC);
