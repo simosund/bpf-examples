@@ -21,7 +21,6 @@
 
 #include <xdp/parsing_helpers.h>
 #include "pping.h"
-#include "pping_debug_cleanup.h"
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -968,11 +967,9 @@ static void close_and_delete_flows(void *ctx, struct packet_info *p_info,
 	if (!is_flowstate_active(fw_flow) && !is_flowstate_active(rev_flow)) {
 		if (bpf_map_delete_elem(&flow_state,
 					get_dualflow_key_from_packet(p_info)) ==
-		    0) {
+		    0)
 			update_map_util(PPING_MAP_FLOWSTATE,
 					PPING_MAPUTIL_SELFDEL, 1);
-			debug_increment_autodel(PPING_MAP_FLOWSTATE);
-		}
 	}
 }
 
@@ -1170,7 +1167,6 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	if (bpf_map_delete_elem(&packet_ts, &p_info->reply_pid) == 0) {
 		__sync_fetch_and_add(&f_state->outstanding_timestamps, -1);
 		update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_SELFDEL, 1);
-		debug_increment_autodel(PPING_MAP_PACKETTS);
 	}
 
 	if (f_state->min_rtt == 0 || rtt < f_state->min_rtt)
@@ -1441,9 +1437,6 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	__u64 now = bpf_ktime_get_ns();
 	__u64 rtt;
 
-	debug_update_mapclean_stats(ctx, &events, !ctx->key || !ctx->value,
-				    ctx->meta->seq_num, now,
-				    PPING_MAP_PACKETTS);
 	mapiter_update_maputil_stats(PPING_MAP_PACKETTS, ctx->meta->seq_num,
 				     !ctx->key || !ctx->value, now);
 
@@ -1464,7 +1457,6 @@ int tsmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 		   on the stack, so copy pid to local_pid. */
 		__builtin_memcpy(&local_pid, pid, sizeof(local_pid));
 		if (bpf_map_delete_elem(&packet_ts, &local_pid) == 0) {
-			debug_increment_timeoutdel(PPING_MAP_PACKETTS);
 			update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_EXPIRED, 1);
 
 			if (f_state)
@@ -1485,9 +1477,6 @@ int flowmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	__u64 now = bpf_ktime_get_ns();
 	bool notify1, notify2, timeout1, timeout2;
 
-	debug_update_mapclean_stats(ctx, &events, !ctx->key || !ctx->value,
-				    ctx->meta->seq_num, now,
-				    PPING_MAP_FLOWSTATE);
 	mapiter_update_maputil_stats(PPING_MAP_FLOWSTATE, ctx->meta->seq_num,
 				     !ctx->key || !ctx->value, now);
 
@@ -1510,7 +1499,6 @@ int flowmap_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 		notify1 = should_notify_closing(f_state1) && timeout1;
 		notify2 = should_notify_closing(f_state2) && timeout2;
 		if (bpf_map_delete_elem(&flow_state, &flow1) == 0) {
-			debug_increment_timeoutdel(PPING_MAP_FLOWSTATE);
 			update_map_util(PPING_MAP_FLOWSTATE, PPING_MAPUTIL_EXPIRED, 1);
 			if (notify1)
 				send_flow_timeout_message(ctx, &flow1, now);

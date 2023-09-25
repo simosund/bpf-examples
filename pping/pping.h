@@ -25,7 +25,6 @@ typedef __u64 fixpoint64;
 #define EVENT_TYPE_FLOW 1
 #define EVENT_TYPE_RTT 2
 #define EVENT_TYPE_MAP_FULL 3
-#define EVENT_TYPE_MAP_CLEAN 4
 
 #define RTT_AGG_NR_BINS 250UL
 #define RTT_AGG_BIN_WIDTH (4 * NS_PER_MS)
@@ -243,33 +242,11 @@ struct map_full_event {
 	__u8 reserved[3];
 };
 
-/*
- * Struct for storing various debug-information about the map cleaning process.
- * The last_* members contain information from the last clean-cycle, whereas the
- * tot_* entires contain cumulative stats from all clean cycles.
- */
-struct map_clean_event {
-	__u64 event_type;
-	__u64 timestamp;
-	__u64 tot_runtime;
-	__u64 tot_processed_entries;
-	__u64 tot_timeout_del;
-	__u64 tot_auto_del;
-	__u64 last_runtime;
-	__u32 last_processed_entries;
-	__u32 last_timeout_del;
-	__u32 last_auto_del;
-	__u32 clean_cycles;
-	enum pping_map map;
-	__u8 reserved[7];
-};
-
 union pping_event {
 	__u64 event_type;
 	struct rtt_event rtt_event;
 	struct flow_event flow_event;
 	struct map_full_event map_event;
-	struct map_clean_event map_clean_event;
 };
 
 struct packet_counters {
