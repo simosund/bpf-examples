@@ -1129,16 +1129,6 @@ static void warn_map_full(FILE *stream, const struct map_full_event *e)
 	fprintf(stream, "\n");
 }
 
-static void print_map_clean_info(FILE *stream, const struct map_clean_event *e)
-{
-	fprintf(stream,
-		"%s: cycle: %u, entries: %u, time: %llu, timeout: %u, tot timeout: %llu, selfdel: %u, tot selfdel: %llu\n",
-		e->map == PPING_MAP_PACKETTS ? "packet_ts" : "flow_state",
-		e->clean_cycles, e->last_processed_entries, e->last_runtime,
-		e->last_timeout_del, e->tot_timeout_del, e->last_auto_del,
-		e->tot_auto_del);
-}
-
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_size)
 {
 	struct output_context *out_ctx = *(struct output_context **)ctx;
@@ -1150,9 +1140,6 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 data_size)
 	switch (e->event_type) {
 	case EVENT_TYPE_MAP_FULL:
 		warn_map_full(stderr, &e->map_event);
-		break;
-	case EVENT_TYPE_MAP_CLEAN:
-		print_map_clean_info(stderr, &e->map_clean_event);
 		break;
 	case EVENT_TYPE_RTT:
 	case EVENT_TYPE_FLOW:
