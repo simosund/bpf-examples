@@ -1122,15 +1122,6 @@ static void print_event(struct output_context *out_ctx,
 	}
 }
 
-static void warn_map_full(FILE *stream, const struct map_full_event *e)
-{
-	print_ns_datetime(stream, e->timestamp);
-	fprintf(stream, " Warning: Unable to create %s entry for flow ",
-		e->map == PPING_MAP_FLOWSTATE ? "flow" : "timestamp");
-	print_flow_ppvizformat(stream, &e->flow);
-	fprintf(stream, "\n");
-}
-
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_size)
 {
 	struct output_context *out_ctx = *(struct output_context **)ctx;
@@ -1140,9 +1131,6 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 data_size)
 		return;
 
 	switch (e->event_type) {
-	case EVENT_TYPE_MAP_FULL:
-		warn_map_full(stderr, &e->map_event);
-		break;
 	case EVENT_TYPE_RTT:
 	case EVENT_TYPE_FLOW:
 		print_event(out_ctx, e);
