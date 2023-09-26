@@ -33,9 +33,6 @@
 // Mask for IPv6 flowlabel + traffic class -  used in fib lookup
 #define IPV6_FLOWINFO_MASK __cpu_to_be32(0x0FFFFFFF)
 
-// Emit a warning max once per second when failing to add entry to map
-#define WARN_MAP_FULL_INTERVAL 1000000000UL
-
 // Time before map entry is considered old and can safetly be removed
 #define TIMESTAMP_LIFETIME (10 * NS_PER_SECOND) // Clear any timestamp older than this
 #define TIMESTAMP_RTT_LIFETIME 8 // Clear timestamp once it is this many times older than RTT
@@ -125,7 +122,6 @@ struct protocol_info {
 char _license[] SEC("license") = "GPL";
 // Global config struct - set from userspace
 static volatile const struct bpf_config config = {};
-static volatile __u64 last_warn_time[2] = { 0 };
 static volatile __u64 iter_map_start[PPING_MAP_N_MAPS];
 
 // Keep an empty aggregated_stats as a global variable to use as a template
@@ -760,30 +756,6 @@ static void send_flow_event(void *ctx, struct packet_info *p_info,
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &fe, sizeof(fe));
 }
 
-/*
- * Send a map-full event for the map.
- * Will only trigger once every WARN_MAP_FULL_INTERVAL
- */
-static void send_map_full_event(void *ctx, struct packet_info *p_info,
-				enum pping_map map)
-{
-	struct map_full_event me;
-
-	if (p_info->time < last_warn_time[map] ||
-	    p_info->time - last_warn_time[map] < WARN_MAP_FULL_INTERVAL)
-		return;
-
-	last_warn_time[map] = p_info->time;
-
-	__builtin_memset(&me, 0, sizeof(me));
-	me.event_type = EVENT_TYPE_MAP_FULL;
-	me.timestamp = p_info->time;
-	me.flow = p_info->pid.flow;
-	me.map = map;
-
-	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &me, sizeof(me));
-}
-
 static void send_rtt_event(void *ctx, __u64 rtt, struct flow_state *f_state,
 			   struct packet_info *p_info)
 {
@@ -879,7 +851,6 @@ static struct dual_flow_state *create_dualflow_state(void *ctx,
 	} else {
 		update_map_util(PPING_MAP_FLOWSTATE, PPING_MAPUTIL_CREATE_FAIL,
 				1);
-		send_map_full_event(ctx, p_info, PPING_MAP_FLOWSTATE);
 		return NULL;
 	}
 
@@ -1157,7 +1128,6 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 	} else {
 		update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_CREATE_FAIL,
 				1);
-		send_map_full_event(ctx, p_info, PPING_MAP_PACKETTS);
 	}
 }
 
