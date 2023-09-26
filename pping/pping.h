@@ -87,6 +87,7 @@ enum __attribute__((__packed__)) pping_map {
 /* Fields in the map_util_stats struct */
 enum pping_maputil_field {
 	PPING_MAPUTIL_CREATED = 0,
+	PPING_MAPUTIL_CREATE_FAIL,
 	PPING_MAPUTIL_SELFDEL,
 	PPING_MAPUTIL_EXPIRED,
 	PPING_MAPUTIL_CLEANCYCLES,

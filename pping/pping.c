@@ -1830,9 +1830,10 @@ static void print_maputil_standard(FILE *stream, __u64 t_monotonic,
 {
 	print_ns_datetime(stream, t_monotonic);
 	fprintf(stream,
-		": %s: entries=%llu, created=%llu, deleted=%llu, expired=%llu, clean-cycles=%llu, clean-proc=%llu, clean-time=%.3f ms\n",
+		": %s: entries=%llu, created=%llu, creation-failed=%llu, deleted=%llu, expired=%llu, clean-cycles=%llu, clean-proc=%llu, clean-time=%.3f ms\n",
 		ppingmap_to_str(map), stats->n_entries,
 		stats->base_stats.fields[PPING_MAPUTIL_CREATED],
+		stats->base_stats.fields[PPING_MAPUTIL_CREATE_FAIL],
 		stats->base_stats.fields[PPING_MAPUTIL_SELFDEL],
 		stats->base_stats.fields[PPING_MAPUTIL_EXPIRED],
 		stats->base_stats.fields[PPING_MAPUTIL_CLEANCYCLES],
@@ -1853,6 +1854,8 @@ static void print_maputil_json(json_writer_t *jctx, __u64 t_monotonic,
 	jsonw_u64_field(jctx, "entries", stats->n_entries);
 	jsonw_u64_field(jctx, "created",
 			stats->base_stats.fields[PPING_MAPUTIL_CREATED]);
+	jsonw_u64_field(jctx, "creation-failed",
+			stats->base_stats.fields[PPING_MAPUTIL_CREATE_FAIL]);
 	jsonw_u64_field(jctx, "deleted",
 			stats->base_stats.fields[PPING_MAPUTIL_SELFDEL]);
 	jsonw_u64_field(jctx, "expired",
