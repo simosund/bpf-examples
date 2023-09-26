@@ -132,10 +132,17 @@ struct extended_maputil_stats {
 	struct map_util_stats base_stats;
 };
 
+struct userspace_maputil_stats {
+	struct map_util_stats stats[PPING_MAP_N_MAPS];
+	int active_agg_instance;
+};
+
 struct map_util_context {
 	struct map_util_stats prev_stats[PPING_MAP_N_MAPS];
+	struct userspace_maputil_stats userspace_stats;
 	__u64 interval;
 	int map_fd;
+	bool report_agg_maps;
 };
 
 // Store configuration values in struct to easily pass around
@@ -1496,13 +1503,14 @@ static void report_aggregated_stats_mapentry(
 static int report_aggregated_stats_map(struct output_context *out_ctx,
 				       int map_fd, int af, __u8 prefix_len,
 				       __u64 t_monotonic,
-				       struct aggregation_config *agg_conf)
+				       struct aggregation_config *agg_conf,
+				       struct map_util_stats *maputil)
 {
 	struct aggregated_stats *values = NULL;
 	void *keys = NULL, *del_keys = NULL;
 	int n_cpus = libbpf_num_possible_cpus();
 	size_t keysize = af == AF_INET ? sizeof(__u32) : sizeof(__u64);
-	__u64 batch, total = 0;
+	__u64 batch, start_time, total = 0;
 	__u32 count = AGG_BATCH_SIZE, del_idx = 0;
 	bool remaining_entries = true;
 	int err = 0, i;
@@ -1517,6 +1525,8 @@ static int report_aggregated_stats_map(struct output_context *out_ctx,
 		err = -ENOMEM;
 		goto exit;
 	}
+
+	start_time = get_time_ns(CLOCK_MONOTONIC);
 
 	while (remaining_entries) {
 		err = bpf_map_lookup_batch(map_fd, total ? &batch : NULL,
@@ -1554,6 +1564,14 @@ static int report_aggregated_stats_map(struct output_context *out_ctx,
 		err = bpf_map_delete_batch(map_fd, del_keys, &del_idx,
 					   &batch_opts);
 
+	if (maputil) {
+		maputil->fields[PPING_MAPUTIL_CLEANTIME] +=
+			get_time_ns(CLOCK_MONOTONIC) - start_time;
+		maputil->fields[PPING_MAPUTIL_CLEANCYCLES]++;
+		maputil->fields[PPING_MAPUTIL_CLEANNPROC] += total;
+		maputil->fields[PPING_MAPUTIL_EXPIRED] += del_idx;
+	}
+
 exit:
 	free(values);
 	free(keys);
@@ -1563,8 +1581,10 @@ exit:
 
 static int report_aggregated_rtts(struct output_context *out_ctx,
 				  struct aggregation_maps *maps,
-				  struct aggregation_config *agg_conf)
+				  struct aggregation_config *agg_conf,
+				  struct userspace_maputil_stats *user_maputil)
 {
+	struct map_util_stats *ipv4_util = NULL, *ipv6_util = NULL;
 	__u64 t = get_time_ns(CLOCK_MONOTONIC);
 	int err, map_idx;
 
@@ -1572,15 +1592,27 @@ static int report_aggregated_rtts(struct output_context *out_ctx,
 	if (map_idx < 0)
 		return map_idx;
 
+	if (user_maputil) {
+		if (map_idx == 0) {
+			user_maputil->active_agg_instance = 1;
+			ipv4_util = &user_maputil->stats[PPING_MAP_AGG_V4_1];
+			ipv6_util = &user_maputil->stats[PPING_MAP_AGG_V6_1];
+		} else {
+			user_maputil->active_agg_instance = 0;
+			ipv4_util = &user_maputil->stats[PPING_MAP_AGG_V4_2];
+			ipv6_util = &user_maputil->stats[PPING_MAP_AGG_V6_2];
+		}
+	}
+
 	err = report_aggregated_stats_map(out_ctx, maps->map_v4_fd[map_idx],
 					  AF_INET, agg_conf->ipv4_prefix_len, t,
-					  agg_conf);
+					  agg_conf, ipv4_util);
 	if (err)
 		return err;
 
 	err = report_aggregated_stats_map(out_ctx, maps->map_v6_fd[map_idx],
 					  AF_INET6, agg_conf->ipv6_prefix_len,
-					  t, agg_conf);
+					  t, agg_conf, ipv6_util);
 	return err;
 }
 
@@ -1776,7 +1808,20 @@ static void compute_extended_maputil_stats(struct extended_maputil_stats *dst,
 
 static const char *ppingmap_to_str(enum pping_map map)
 {
-	return map == PPING_MAP_FLOWSTATE ? "flow-state" : "packet-timestamps";
+	switch (map) {
+	case PPING_MAP_FLOWSTATE:
+		return "flow-state";
+	case PPING_MAP_PACKETTS:
+		return "packet-timestamp";
+	case PPING_MAP_AGG_V4_1:
+	case PPING_MAP_AGG_V4_2:
+		return "aggregation-IPv4";
+	case PPING_MAP_AGG_V6_1:
+	case PPING_MAP_AGG_V6_2:
+		return "aggregation-IPv6";
+	default:
+		return "unknown";
+	}
 }
 
 static void print_maputil_standard(FILE *stream, __u64 t_monotonic,
@@ -1856,9 +1901,11 @@ exit:
 	return err;
 }
 
-static int get_current_maputil_stats(int map_fd, enum pping_map map,
-				     struct extended_maputil_stats *dst,
-				     struct map_util_stats *prev_stats)
+static int
+get_current_maputil_stats(int map_fd, enum pping_map map,
+			  struct extended_maputil_stats *dst,
+			  struct map_util_stats *prev_stats,
+			  const struct map_util_stats *userspace_stats)
 {
 	struct map_util_stats tot;
 	int err;
@@ -1866,6 +1913,9 @@ static int get_current_maputil_stats(int map_fd, enum pping_map map,
 	err = fetch_kernel_maputil_stats(map_fd, map, &tot);
 	if (err)
 		return err;
+
+	if (userspace_stats)
+		add_maputil_stats(&tot, userspace_stats);
 
 	compute_extended_maputil_stats(dst, &tot, prev_stats);
 	*prev_stats = tot;
@@ -1881,10 +1931,12 @@ static int report_map_maputil(struct output_context *out_ctx,
 	__u64 t;
 
 	t = get_time_ns(CLOCK_MONOTONIC);
-	err = get_current_maputil_stats(maputil_ctx->map_fd, map, &stats,
-					&maputil_ctx->prev_stats[map]);
+	err = get_current_maputil_stats(
+		maputil_ctx->map_fd, map, &stats, &maputil_ctx->prev_stats[map],
+		&maputil_ctx->userspace_stats.stats[map]);
 	if (err)
 		return err;
+
 	print_maputil(out_ctx, t, map, &stats);
 
 	return 0;
@@ -1893,6 +1945,7 @@ static int report_map_maputil(struct output_context *out_ctx,
 static int report_maputil(struct output_context *out_ctx,
 			  struct map_util_context *maputil_ctx)
 {
+	enum pping_map agg_v4, agg_v6;
 	int err;
 
 	err = report_map_maputil(out_ctx, maputil_ctx, PPING_MAP_FLOWSTATE);
@@ -1900,7 +1953,28 @@ static int report_maputil(struct output_context *out_ctx,
 		return err;
 
 	err = report_map_maputil(out_ctx, maputil_ctx, PPING_MAP_PACKETTS);
-	return err;
+	if (err)
+		return err;
+
+	if (maputil_ctx->report_agg_maps) {
+		if (maputil_ctx->userspace_stats.active_agg_instance == 0) {
+			agg_v4 = PPING_MAP_AGG_V4_1;
+			agg_v6 = PPING_MAP_AGG_V6_1;
+		} else {
+			agg_v4 = PPING_MAP_AGG_V4_2;
+			agg_v6 = PPING_MAP_AGG_V6_2;
+		}
+
+		err = report_map_maputil(out_ctx, maputil_ctx, agg_v4);
+		if (err)
+			return err;
+
+		err = report_map_maputil(out_ctx, maputil_ctx, agg_v6);
+		if (err)
+			return err;
+	}
+
+	return 0;
 }
 
 /*
@@ -2283,7 +2357,8 @@ int fetch_aggregation_map_fds(struct bpf_object *obj,
 }
 
 static int init_agg_backup_entries(struct aggregation_maps *maps, bool ipv4,
-				   bool ipv6)
+				   bool ipv6,
+				   struct userspace_maputil_stats *user_maputil)
 {
 	struct aggregated_stats *empty_stats;
 	struct ipprefix_key key;
@@ -2303,6 +2378,11 @@ static int init_agg_backup_entries(struct aggregation_maps *maps, bool ipv4,
 			if (err)
 				goto exit;
 		}
+
+		user_maputil->stats[PPING_MAP_AGG_V4_1]
+			.fields[PPING_MAPUTIL_CREATED] += 1;
+		user_maputil->stats[PPING_MAP_AGG_V4_2]
+			.fields[PPING_MAPUTIL_CREATED] += 1;
 	}
 
 	if (ipv6) {
@@ -2315,6 +2395,11 @@ static int init_agg_backup_entries(struct aggregation_maps *maps, bool ipv4,
 			if (err)
 				goto exit;
 		}
+
+		user_maputil->stats[PPING_MAP_AGG_V6_1]
+			.fields[PPING_MAPUTIL_CREATED] += 1;
+		user_maputil->stats[PPING_MAP_AGG_V6_2]
+			.fields[PPING_MAPUTIL_CREATED] += 1;
 	}
 
 exit:
@@ -2371,6 +2456,16 @@ static int init_aggregation_reporting(struct bpf_object *obj,
 {
 	int err, fd;
 
+	config->maputil_ctx.userspace_stats.active_agg_instance = 0;
+	memset(&config->maputil_ctx.userspace_stats.stats[PPING_MAP_AGG_V4_1],
+	       0, sizeof(config->maputil_ctx.userspace_stats.stats[0]));
+	memset(&config->maputil_ctx.userspace_stats.stats[PPING_MAP_AGG_V4_2],
+	       0, sizeof(config->maputil_ctx.userspace_stats.stats[0]));
+	memset(&config->maputil_ctx.userspace_stats.stats[PPING_MAP_AGG_V6_1],
+	       0, sizeof(config->maputil_ctx.userspace_stats.stats[0]));
+	memset(&config->maputil_ctx.userspace_stats.stats[PPING_MAP_AGG_V6_2],
+	       0, sizeof(config->maputil_ctx.userspace_stats.stats[0]));
+
 	err = fetch_aggregation_map_fds(obj, &config->agg_maps);
 	if (err) {
 		fprintf(stderr, "Failed fetching aggregation maps: %s\n",
@@ -2380,7 +2475,8 @@ static int init_aggregation_reporting(struct bpf_object *obj,
 
 	err = init_agg_backup_entries(&config->agg_maps,
 				      config->agg_conf.ipv4_prefix_len > 0,
-				      config->agg_conf.ipv6_prefix_len > 0);
+				      config->agg_conf.ipv6_prefix_len > 0,
+				      &config->maputil_ctx.userspace_stats);
 	if (err) {
 		fprintf(stderr,
 			"Failed initalized backup entries in aggregation maps: %s\n",
@@ -2400,10 +2496,11 @@ static int init_aggregation_reporting(struct bpf_object *obj,
 	return fd;
 }
 
-static int handle_aggregation_timer(int timer_fd,
-				    struct output_context *out_ctx,
-				    struct aggregation_maps *maps,
-				    struct aggregation_config *agg_conf)
+static int
+handle_aggregation_timer(int timer_fd, struct output_context *out_ctx,
+			 struct aggregation_maps *maps,
+			 struct aggregation_config *agg_conf,
+			 struct userspace_maputil_stats *userspace_maputil)
 {
 	int err;
 
@@ -2411,7 +2508,8 @@ static int handle_aggregation_timer(int timer_fd,
 	if (err)
 		return err;
 
-	err = report_aggregated_rtts(out_ctx, maps, agg_conf);
+	err = report_aggregated_rtts(out_ctx, maps, agg_conf,
+				     userspace_maputil);
 	if (err) {
 		fprintf(stderr, "Failed reporting aggregated RTTs: %s\n",
 			get_libbpf_strerror(err));
@@ -2472,6 +2570,16 @@ static int init_maputil_reporting(const struct bpf_object *obj,
 
 	memset(config->maputil_ctx.prev_stats, 0,
 	       sizeof(config->maputil_ctx.prev_stats));
+
+	/* Flowstate and packet-ts have no userspace stats, so zero them.
+	   But do NOT zero aggregation stats, as aggregation setup handles
+	   initializing those */
+	memset(&config->maputil_ctx.userspace_stats.stats[PPING_MAP_PACKETTS],
+	       0, sizeof(config->maputil_ctx.userspace_stats.stats[0]));
+	memset(&config->maputil_ctx.userspace_stats.stats[PPING_MAP_FLOWSTATE],
+	       0, sizeof(config->maputil_ctx.userspace_stats.stats[0]));
+
+	config->maputil_ctx.report_agg_maps = config->bpf_config.agg_rtts;
 
 	map_fd = bpf_object__find_map_fd_by_name(obj, config->mapstats_map);
 	if (map_fd < 0) {
@@ -2627,7 +2735,8 @@ static int epoll_poll_events(int epfd, struct pping_config *config,
 			err = handle_aggregation_timer(
 				events[i].data.u64 & PPING_EPEVENT_MASK,
 				config->out_ctx, &config->agg_maps,
-				&config->agg_conf);
+				&config->agg_conf,
+				&config->maputil_ctx.userspace_stats);
 			break;
 		case PPING_EPEVENT_TYPE_GLOBCNTTIMER:
 			err = handle_globalcount_timer(
