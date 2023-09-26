@@ -77,6 +77,10 @@ enum __attribute__((__packed__)) flow_event_source {
 enum __attribute__((__packed__)) pping_map {
 	PPING_MAP_FLOWSTATE = 0,
 	PPING_MAP_PACKETTS,
+	PPING_MAP_AGG_V4_1,
+	PPING_MAP_AGG_V4_2,
+	PPING_MAP_AGG_V6_1,
+	PPING_MAP_AGG_V6_2,
 	PPING_MAP_N_MAPS
 };
 

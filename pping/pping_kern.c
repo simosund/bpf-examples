@@ -208,7 +208,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, __u32);
 	__type(value, struct map_util_stats);
-	__uint(max_entries, 2);
+	__uint(max_entries, PPING_MAP_N_MAPS);
 } map_maputil_stats SEC(".maps");
 
 // Help functions
@@ -1073,9 +1073,10 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv, bool create)
 {
 	struct aggregated_stats *agg;
 	struct ipprefix_key key;
+	enum pping_map map;
 	__u32 *map_choice;
 	__u32 zero = 0;
-	void *agg_map;
+	void *map_ptr;
 	int err = 0;
 
 	map_choice = bpf_map_lookup_elem(&map_active_agg_instance, &zero);
@@ -1084,31 +1085,43 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv, bool create)
 
 	if (ipv == AF_INET) {
 		create_ipprefix_key_v4(&key.v4, ip);
-		agg_map = *map_choice == 0 ? (void *)&map_v4_agg1 :
-					     (void *)&map_v4_agg2;
+		if (*map_choice == 0) {
+			map = PPING_MAP_AGG_V4_1;
+			map_ptr = &map_v4_agg1;
+		} else {
+			map = PPING_MAP_AGG_V4_2;
+			map_ptr = &map_v4_agg2;
+		}
 	} else {
 		create_ipprefix_key_v6(&key.v6, ip);
-		agg_map = *map_choice == 0 ? (void *)&map_v6_agg1 :
-					     (void *)&map_v6_agg2;
+		if (*map_choice == 0) {
+			map = PPING_MAP_AGG_V6_1;
+			map_ptr = &map_v6_agg1;
+		} else {
+			map = PPING_MAP_AGG_V6_2;
+			map_ptr = &map_v6_agg2;
+		}
 	}
 
-	agg = bpf_map_lookup_elem(agg_map, &key);
+	agg = bpf_map_lookup_elem(map_ptr, &key);
 	if (agg)
 		return agg;
 
 	// No existing entry, try to create new one
 	if (create)
-		err = bpf_map_update_elem(agg_map, &key, &empty_stats,
+		err = bpf_map_update_elem(map_ptr, &key, &empty_stats,
 					  BPF_NOEXIST);
-        // Cannot create new entry, switch to backup entry
-	if (!create || (err && err != -EEXIST)) {
+	if (create && !err) {
+		update_map_util(map, PPING_MAPUTIL_CREATED, 1);
+	} else if (err != -EEXIST) {
+                // Cannot create new entry, switch to backup entry
 		if (ipv == AF_INET)
 			key.v4 = IPV4_BACKUP_KEY;
 		else
 			key.v6 = IPV6_BACKUP_KEY;
 	}
 
-	return bpf_map_lookup_elem(agg_map, &key);
+	return bpf_map_lookup_elem(map_ptr, &key);
 }
 
 static void aggregate_rtt(__u64 rtt, struct aggregated_stats *agg_stats)
