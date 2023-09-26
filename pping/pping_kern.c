@@ -907,6 +907,8 @@ static struct dual_flow_state *create_dualflow_state(void *ctx,
 	    0) {
 		update_map_util(PPING_MAP_FLOWSTATE, PPING_MAPUTIL_CREATED, 1);
 	} else {
+		update_map_util(PPING_MAP_FLOWSTATE, PPING_MAPUTIL_CREATE_FAIL,
+				1);
 		send_map_full_event(ctx, p_info, PPING_MAP_FLOWSTATE);
 		return NULL;
 	}
@@ -1114,7 +1116,10 @@ lookup_or_create_aggregation_stats(struct in6_addr *ip, __u8 ipv, bool create)
 	if (create && !err) {
 		update_map_util(map, PPING_MAPUTIL_CREATED, 1);
 	} else if (err != -EEXIST) {
-                // Cannot create new entry, switch to backup entry
+		// Cannot create new entry, switch to backup entry
+		if (create)
+			update_map_util(map, PPING_MAPUTIL_CREATE_FAIL, 1);
+
 		if (ipv == AF_INET)
 			key.v4 = IPV4_BACKUP_KEY;
 		else
@@ -1180,6 +1185,8 @@ static void pping_timestamp_packet(struct flow_state *f_state, void *ctx,
 		__sync_fetch_and_add(&f_state->outstanding_timestamps, 1);
 		update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_CREATED, 1);
 	} else {
+		update_map_util(PPING_MAP_PACKETTS, PPING_MAPUTIL_CREATE_FAIL,
+				1);
 		send_map_full_event(ctx, p_info, PPING_MAP_PACKETTS);
 	}
 }
