@@ -204,6 +204,13 @@ struct {
 	__uint(max_entries, 1);
 } map_packet_info SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 2);
+} map_cpu_counter SEC(".maps");
+
 // Help functions
 
 /*
@@ -1340,6 +1347,18 @@ static void pping_parsed_packet(void *ctx, struct packet_info *p_info)
 	close_and_delete_flows(ctx, p_info, fw_flow, rev_flow);
 }
 
+static void update_cpucounter(bool is_ingress)
+{
+	__u64 *cpu_counter;
+	__u32 key = is_ingress ? 0 : 1;
+
+	cpu_counter = bpf_map_lookup_elem(&map_cpu_counter, &key);
+	if (!cpu_counter)
+		return;
+
+	(*cpu_counter)++;
+}
+
 /*
  * Main function which contains all the pping logic (parse packet, attempt to
  * create timestamp for it, try match against previous timestamps, update
@@ -1354,6 +1373,8 @@ static void pping_tc(struct __sk_buff *ctx, bool is_ingress)
 {
 	struct packet_info *p_info;
 	__u32 key = 0;
+
+	update_cpucounter(is_ingress);
 
 	p_info = bpf_map_lookup_elem(&map_packet_info, &key);
 	if (!p_info)
@@ -1372,6 +1393,8 @@ static void pping_xdp(struct xdp_md *ctx)
 {
 	struct packet_info *p_info;
 	__u32 key = 0;
+
+	update_cpucounter(true);
 
 	p_info = bpf_map_lookup_elem(&map_packet_info, &key);
 	if (!p_info)
