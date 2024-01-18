@@ -27,7 +27,7 @@ int main(int argc, char *argv[])
 	struct dummy_kern *obj;
 	ssize_t read_bytes;
 	sigset_t mask;
-	int fd, err;
+	int fd, err = 0;
 
 	fprintf(stdout, "%s\n", __doc__);
 
@@ -38,28 +38,48 @@ int main(int argc, char *argv[])
 	fd = signalfd(-1, &mask, 0);
 	pthread_sigmask(SIG_BLOCK, &mask, NULL);
 
-	obj = dummy_kern__open_and_load();
+	obj = dummy_kern__open();
         if (!obj) {
-		fprintf(stderr, "Failure open/loading (%ld)\n",
-			libbpf_get_error(obj));
+		err = libbpf_get_error(obj);
+		fprintf(stderr, "Failed opening BPF program: %d\n", err);
 		return EXIT_FAILURE;
-	}
+        }
+
+	obj->rodata->my_config = 0;
+
+	err = dummy_kern__load(obj);
+        if (err) {
+		fprintf(stderr, "Failed loading BPF progam: %d\n", err);
+		goto exit_destroy;
+        }
+
+        /* obj = dummy_kern__open_and_load(); */
+        /* if (!obj) { */
+	/* 	fprintf(stderr, "Failure open/loading (%ld)\n", */
+	/* 		libbpf_get_error(obj)); */
+	/* 	return EXIT_FAILURE; */
+	/* } */
 
 	err = dummy_kern__attach(obj);
 	if (err) {
-		fprintf(stderr, "Failure attaching (%ld)\n",
-			libbpf_get_error(obj));
-		return EXIT_FAILURE;
+		fprintf(stderr, "Failure attaching (%d)\n", err);
+		goto exit_destroy;
 	}
 
 	// Wait until user hits CTRL-C
 	fprintf(stdout, "eBPF program dummy_prog is now attached\n");
 	fprintf(stdout, "eBPF program will stay attached as long as this user space program is running\n");
 	fprintf(stdout, "Hit CTRL-C to quit\n");
-	read_bytes = read(fd, &sig_info, sizeof(sig_info));
-	if (read_bytes != sizeof(sig_info))
-		return EXIT_FAILURE;
 
+	read_bytes = read(fd, &sig_info, sizeof(sig_info));
+        if (read_bytes != sizeof(sig_info)) {
+		err = -EINVAL;
+		goto exit_detach;
+        }
+
+exit_detach:
+	dummy_kern__detach(obj);
+exit_destroy:
 	dummy_kern__destroy(obj);
-	return EXIT_SUCCESS;
+	return err;
 }
