@@ -11,7 +11,7 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-static volatile const u64 TAI_OFFSET = (37UL * NS_PER_S);
+volatile const signed long long TAI_OFFSET = (37LL * NS_PER_S);
 
 /* Helpers in maps.bpf.h require any histogram key to be a struct with a bucket member */
 struct hist_key {
