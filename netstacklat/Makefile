@@ -4,6 +4,7 @@ USER_TARGETS   := netstacklat
 BPF_TARGETS    := netstacklat.bpf
 BPF_SKEL_OBJ   := netstacklat.bpf.o
 
+EXTRA_CFLAGS += -DBPF_EXAMPLES
 EXTRA_DEPS += netstacklat.h bits.bpf.h maps.bpf.h
 LDLIBS     += -lm
 
