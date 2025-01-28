@@ -1,0 +1,35 @@
+metrics:
+  histograms:
+    - name: netstack_latency_tcp_v4_do_rcv_seconds
+      help: Netstack latency up to the tcp_v4_do_rcv() function
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_latency_tcp_data_queue_seconds
+      help: Netstack latency up to the tcp_data_queue() function
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_latency_udp_queue_rcv_seconds
+      help: Netstack latency up to the udp_queue_rcv_one_skb() function
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
