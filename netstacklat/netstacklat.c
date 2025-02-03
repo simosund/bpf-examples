@@ -178,242 +178,242 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 	return 0;
 }
 
-static const char *hook_to_str(enum netstacklat_hook hook)
-{
-	switch (hook) {
-	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV:
-		return "tcp_v4_do_rcv";
-	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE:
-		return "tcp_data_queue";
-	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE:
-		return "udp_queue_rcv_one_skb";
-	default:
-		return "invalid";
-	}
-}
+/* static const char *hook_to_str(enum netstacklat_hook hook) */
+/* { */
+/* 	switch (hook) { */
+/* 	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV: */
+/* 		return "tcp_v4_do_rcv"; */
+/* 	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE: */
+/* 		return "tcp_data_queue"; */
+/* 	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE: */
+/* 		return "udp_queue_rcv_one_skb"; */
+/* 	default: */
+/* 		return "invalid"; */
+/* 	} */
+/* } */
 
-static int hook_to_histmap(enum netstacklat_hook hook,
-			   const struct netstacklat_bpf *obj)
-{
-	switch (hook) {
-	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV:
-		return bpf_map__fd(obj->maps.tcp_v4_do_rcv_hist);
-	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE:
-		return bpf_map__fd(obj->maps.tcp_data_queue_hist);
-	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE:
-		return bpf_map__fd(obj->maps.udp_queue_rcv_hist);
-	default:
-		return -EINVAL;
-	}
-}
+/* static int hook_to_histmap(enum netstacklat_hook hook, */
+/* 			   const struct netstacklat_bpf *obj) */
+/* { */
+/* 	switch (hook) { */
+/* 	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV: */
+/* 		return bpf_map__fd(obj->maps.tcp_v4_do_rcv_hist); */
+/* 	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE: */
+/* 		return bpf_map__fd(obj->maps.tcp_data_queue_hist); */
+/* 	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE: */
+/* 		return bpf_map__fd(obj->maps.udp_queue_rcv_hist); */
+/* 	default: */
+/* 		return -EINVAL; */
+/* 	} */
+/* } */
 
-static int find_first_nonzero(int nbins, __u64 hist[nbins])
-{
-	int i;
+/* static int find_first_nonzero(int nbins, __u64 hist[nbins]) */
+/* { */
+/* 	int i; */
 
-	for (i = 0; i < nbins; i++) {
-		if (hist[i] > 0)
-			return i;
-	}
+/* 	for (i = 0; i < nbins; i++) { */
+/* 		if (hist[i] > 0) */
+/* 			return i; */
+/* 	} */
 
-	return -1;
-}
+/* 	return -1; */
+/* } */
 
-static int find_last_nonzero(int nbins, __u64 hist[nbins])
-{
-	int i;
+/* static int find_last_nonzero(int nbins, __u64 hist[nbins]) */
+/* { */
+/* 	int i; */
 
-	for (i = nbins - 1; i >= 0; i--) {
-		if (hist[i] > 0)
-			return i;
-	}
+/* 	for (i = nbins - 1; i >= 0; i--) { */
+/* 		if (hist[i] > 0) */
+/* 			return i; */
+/* 	} */
 
-	return -1;
-}
+/* 	return -1; */
+/* } */
 
-static int find_largest_bin(int nbins, __u64 hist[nbins])
-{
-	__u64 max_val = 0;
-	int i;
+/* static int find_largest_bin(int nbins, __u64 hist[nbins]) */
+/* { */
+/* 	__u64 max_val = 0; */
+/* 	int i; */
 
-	for (i = 0; i < nbins; i++) {
-		if (hist[i] > max_val)
-			max_val = hist[i];
-	}
+/* 	for (i = 0; i < nbins; i++) { */
+/* 		if (hist[i] > max_val) */
+/* 			max_val = hist[i]; */
+/* 	} */
 
-	return max_val;
-}
+/* 	return max_val; */
+/* } */
 
-static double ns_to_siprefix(double ns, char **prefix)
-{
-	static char *prefixes[] = { "n", "u", "m", "" };
-	int psteps = 0;
+/* static double ns_to_siprefix(double ns, char **prefix) */
+/* { */
+/* 	static char *prefixes[] = { "n", "u", "m", "" }; */
+/* 	int psteps = 0; */
 
-	while (ns >= 1000 && psteps < ARRAY_SIZE(prefixes) - 1) {
-		ns /= 1000;
-		psteps++;
-	}
+/* 	while (ns >= 1000 && psteps < ARRAY_SIZE(prefixes) - 1) { */
+/* 		ns /= 1000; */
+/* 		psteps++; */
+/* 	} */
 
-	*prefix = prefixes[psteps];
+/* 	*prefix = prefixes[psteps]; */
 
-	return ns;
-}
+/* 	return ns; */
+/* } */
 
-static void print_nchars(FILE *stream, char c, int n)
-{
-	while (n-- > 0)
-		fprintf(stream, "%c", c);
-}
+/* static void print_nchars(FILE *stream, char c, int n) */
+/* { */
+/* 	while (n-- > 0) */
+/* 		fprintf(stream, "%c", c); */
+/* } */
 
-static int print_bin_interval(FILE *stream, double low_bound_ns,
-			      double high_bound_ns)
-{
-	char *lprefix, *hprefix;
-	double low_si, high_si;
+/* static int print_bin_interval(FILE *stream, double low_bound_ns, */
+/* 			      double high_bound_ns) */
+/* { */
+/* 	char *lprefix, *hprefix; */
+/* 	double low_si, high_si; */
 
-	low_si = ns_to_siprefix(low_bound_ns, &lprefix);
+/* 	low_si = ns_to_siprefix(low_bound_ns, &lprefix); */
 
-	if (isinf(high_bound_ns)) {
-		high_si = INFINITY;
-		hprefix = " ";
-	} else {
-		high_si = ns_to_siprefix(high_bound_ns, &hprefix);
-	}
+/* 	if (isinf(high_bound_ns)) { */
+/* 		high_si = INFINITY; */
+/* 		hprefix = " "; */
+/* 	} else { */
+/* 		high_si = ns_to_siprefix(high_bound_ns, &hprefix); */
+/* 	} */
 
-	return fprintf(stream, "[%.3g%ss, %.3g%ss)", low_si, lprefix, high_si,
-		       hprefix);
-}
+/* 	return fprintf(stream, "[%.3g%ss, %.3g%ss)", low_si, lprefix, high_si, */
+/* 		       hprefix); */
+/* } */
 
-static void print_histbar(FILE *stream, __u64 count, __u64 max_count)
-{
-	int barlen = round((double)count / max_count * MAX_BAR_STRLEN);
+/* static void print_histbar(FILE *stream, __u64 count, __u64 max_count) */
+/* { */
+/* 	int barlen = round((double)count / max_count * MAX_BAR_STRLEN); */
 
-	fprintf(stream, "|");
-	print_nchars(stream, '@', barlen);
-	print_nchars(stream, ' ', MAX_BAR_STRLEN - barlen);
-	fprintf(stream, "|");
-}
+/* 	fprintf(stream, "|"); */
+/* 	print_nchars(stream, '@', barlen); */
+/* 	print_nchars(stream, ' ', MAX_BAR_STRLEN - barlen); */
+/* 	fprintf(stream, "|"); */
+/* } */
 
-static void print_log2hist(FILE *stream, int nbins, __u64 hist[nbins],
-			   double multiplier)
-{
-	int bin, start_bin, end_bin, max_bin, len;
-	double low_bound, high_bound = 0;
+/* static void print_log2hist(FILE *stream, int nbins, __u64 hist[nbins], */
+/* 			   double multiplier) */
+/* { */
+/* 	int bin, start_bin, end_bin, max_bin, len; */
+/* 	double low_bound, high_bound = 0; */
 
-	start_bin = find_first_nonzero(nbins - 1, hist);
-	end_bin = find_last_nonzero(nbins - 1, hist);
-	max_bin = find_largest_bin(nbins - 1, hist);
+/* 	start_bin = find_first_nonzero(nbins - 1, hist); */
+/* 	end_bin = find_last_nonzero(nbins - 1, hist); */
+/* 	max_bin = find_largest_bin(nbins - 1, hist); */
 
-	for (bin = max(0, start_bin); bin <= end_bin; bin++) {
-		low_bound = pow(2, bin) * multiplier;
-		high_bound = low_bound * 2;
+/* 	for (bin = max(0, start_bin); bin <= end_bin; bin++) { */
+/* 		low_bound = pow(2, bin) * multiplier; */
+/* 		high_bound = low_bound * 2; */
 
-		/*
-		 * First bin will also include 0, i.e. [0, 2)
-		 * Final bin will include any values too large to fit in the
-		 * second-last bin.
-		 */
-		if (bin == 0)
-			low_bound = 0;
-		if (bin == nbins - 2)
-			high_bound = INFINITY;
+/* 		/\* */
+/* 		 * First bin will also include 0, i.e. [0, 2) */
+/* 		 * Final bin will include any values too large to fit in the */
+/* 		 * second-last bin. */
+/* 		 *\/ */
+/* 		if (bin == 0) */
+/* 			low_bound = 0; */
+/* 		if (bin == nbins - 2) */
+/* 			high_bound = INFINITY; */
 
-		len = print_bin_interval(stream, low_bound, high_bound);
-		print_nchars(stream, ' ', max(0, MAX_BINSPAN_STRLEN - len) + 1);
-		fprintf(stream, "%*llu ", MAX_BINCOUNT_STRLEN, hist[bin]);
+/* 		len = print_bin_interval(stream, low_bound, high_bound); */
+/* 		print_nchars(stream, ' ', max(0, MAX_BINSPAN_STRLEN - len) + 1); */
+/* 		fprintf(stream, "%*llu ", MAX_BINCOUNT_STRLEN, hist[bin]); */
 
-		print_histbar(stream, hist[bin], max_bin);
+/* 		print_histbar(stream, hist[bin], max_bin); */
 
-		fprintf(stream, "\n");
-	}
+/* 		fprintf(stream, "\n"); */
+/* 	} */
 
-	// Final "bin" contains the total sum of all values rather than a count
-	fprintf(stream, "Sum: %llu\n", hist[nbins - 1]);
-}
+/* 	// Final "bin" contains the total sum of all values rather than a count */
+/* 	fprintf(stream, "Sum: %llu\n", hist[nbins - 1]); */
+/* } */
 
-static void merge_percpu_hist(int nbins, int ncpus,
-			      const __u64 percpu_hist[nbins][ncpus],
-			      __u64 merged_hist[nbins])
-{
-	int idx, cpu;
+/* static void merge_percpu_hist(int nbins, int ncpus, */
+/* 			      const __u64 percpu_hist[nbins][ncpus], */
+/* 			      __u64 merged_hist[nbins]) */
+/* { */
+/* 	int idx, cpu; */
 
-	memset(merged_hist, 0, sizeof(__u64) * nbins);
+/* 	memset(merged_hist, 0, sizeof(__u64) * nbins); */
 
-	for (idx = 0; idx < nbins; idx++) {
-		for (cpu = 0; cpu < ncpus; cpu++) {
-			merged_hist[idx] += percpu_hist[idx][cpu];
-		}
-	}
-}
+/* 	for (idx = 0; idx < nbins; idx++) { */
+/* 		for (cpu = 0; cpu < ncpus; cpu++) { */
+/* 			merged_hist[idx] += percpu_hist[idx][cpu]; */
+/* 		} */
+/* 	} */
+/* } */
 
-static int fetch_hist_map(int map_fd, __u64 hist[HIST_NBINS])
-{
-	__u32 in_batch, out_batch, count = HIST_NBINS;
-	int ncpus = libbpf_num_possible_cpus();
-	__u32 idx, idxs_fetched = 0;
-	__u64 (*percpu_hist)[ncpus];
-	__u32 *keys;
-	int err = 0;
+/* static int fetch_hist_map(int map_fd, __u64 hist[HIST_NBINS]) */
+/* { */
+/* 	__u32 in_batch, out_batch, count = HIST_NBINS; */
+/* 	int ncpus = libbpf_num_possible_cpus(); */
+/* 	__u32 idx, idxs_fetched = 0; */
+/* 	__u64 (*percpu_hist)[ncpus]; */
+/* 	__u32 *keys; */
+/* 	int err = 0; */
 
-	DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, batch_opts, .flags = BPF_EXIST);
+/* 	DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, batch_opts, .flags = BPF_EXIST); */
 
-	percpu_hist = calloc(HIST_NBINS, sizeof(*percpu_hist));
-	keys = calloc(HIST_NBINS, sizeof(*keys));
-	if (!percpu_hist || !keys)
-		return -ENOMEM;
+/* 	percpu_hist = calloc(HIST_NBINS, sizeof(*percpu_hist)); */
+/* 	keys = calloc(HIST_NBINS, sizeof(*keys)); */
+/* 	if (!percpu_hist || !keys) */
+/* 		return -ENOMEM; */
 
-	while (idxs_fetched < HIST_NBINS) {
-		err = bpf_map_lookup_batch(map_fd,
-					   idxs_fetched > 0 ? &in_batch : NULL,
-					   &out_batch, keys + idxs_fetched,
-					   percpu_hist + idxs_fetched, &count,
-					   &batch_opts);
-		if (err == -ENOENT) // All entries fetched
-			err = 0;
-		else if (err)
-			goto exit;
+/* 	while (idxs_fetched < HIST_NBINS) { */
+/* 		err = bpf_map_lookup_batch(map_fd, */
+/* 					   idxs_fetched > 0 ? &in_batch : NULL, */
+/* 					   &out_batch, keys + idxs_fetched, */
+/* 					   percpu_hist + idxs_fetched, &count, */
+/* 					   &batch_opts); */
+/* 		if (err == -ENOENT) // All entries fetched */
+/* 			err = 0; */
+/* 		else if (err) */
+/* 			goto exit; */
 
-		// Verify keys match expected idx range
-		for (idx = idxs_fetched; idx < idxs_fetched + count; idx++) {
-			if (keys[idx] != idx) {
-				err = -EBADSLT;
-				goto exit;
-			}
-		}
+/* 		// Verify keys match expected idx range */
+/* 		for (idx = idxs_fetched; idx < idxs_fetched + count; idx++) { */
+/* 			if (keys[idx] != idx) { */
+/* 				err = -EBADSLT; */
+/* 				goto exit; */
+/* 			} */
+/* 		} */
 
-		in_batch = out_batch;
-		idxs_fetched += count;
-		count = HIST_NBINS - idxs_fetched;
-	}
+/* 		in_batch = out_batch; */
+/* 		idxs_fetched += count; */
+/* 		count = HIST_NBINS - idxs_fetched; */
+/* 	} */
 
-	merge_percpu_hist(HIST_NBINS, ncpus, percpu_hist, hist);
+/* 	merge_percpu_hist(HIST_NBINS, ncpus, percpu_hist, hist); */
 
-exit:
-	free(percpu_hist);
-	free(keys);
-	return err;
-}
+/* exit: */
+/* 	free(percpu_hist); */
+/* 	free(keys); */
+/* 	return err; */
+/* } */
 
 static int report_stats(const struct netstacklat_bpf *obj)
 {
-	enum netstacklat_hook hook;
-	__u64 hist[HIST_NBINS] = { 0 };
+	/* enum netstacklat_hook hook; */
+	/* __u64 hist[HIST_NBINS] = { 0 }; */
 	time_t t;
-	int err;
+	/* int err; */
 
 	time(&t);
 	printf("%s", ctime(&t));
 
-	for (hook = 1; hook < NETSTACKLAT_N_HOOKS; hook++) {
-		printf("%s:\n", hook_to_str(hook));
+	/* for (hook = 1; hook < NETSTACKLAT_N_HOOKS; hook++) { */
+	/* 	printf("%s:\n", hook_to_str(hook)); */
 
-		err = fetch_hist_map(hook_to_histmap(hook, obj), hist);
-		if (err)
-			return err;
+	/* 	err = fetch_hist_map(hook_to_histmap(hook, obj), hist); */
+	/* 	if (err) */
+	/* 		return err; */
 
-		print_log2hist(stdout, ARRAY_SIZE(hist), hist, 1);
-		printf("\n");
-	}
+	/* 	print_log2hist(stdout, ARRAY_SIZE(hist), hist, 1); */
+	/* 	printf("\n"); */
+	/* } */
 
 	return 0;
 }
