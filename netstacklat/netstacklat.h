@@ -2,15 +2,14 @@
 #ifndef NETSTACKLAT_H
 #define NETSTACKLAT_H
 
-// Histograms support values up to 2^30 ns-> 1s
-#define HIST_MAX_LATENCY_SLOT 30
 /*
- * MAX_LATENCY_SLOT + 1 bin for hist, +1 "bin" for the "sum key"
- * (https://github.com/cloudflare/ebpf_exporter?tab=readme-ov-file#sum-keys)
- * that ebpf_exporter expects for exp2 hists, see the _increment_histogram
- * macro in maps.bpf.h.
+ * Highest number of useable bins in the histogram.
+ * The valid range for storing bin counts is thus idx 0 - HIST_MAX_BINS - 1.
+ * Note that this does NOT include the additional "sum bin" that is stored
+ * at the end of the histogram, so maps may contain a total of
+ * HIST_MAX_BINS + 1 elements.
  */
-#define HIST_NBINS (HIST_MAX_LATENCY_SLOT + 2)
+#define HIST_MAX_BINS 256
 
 #define NS_PER_S 1000000000
 

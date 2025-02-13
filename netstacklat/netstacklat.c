@@ -26,6 +26,9 @@ static const char *__doc__ =
 
 struct netstacklat_config {
 	double report_interval_s;
+	double histogram_exp_basis;
+	int histogram_nbins;
+	__u64 histogram_bin_limits[HIST_MAX_BINS];
 };
 
 #define MAX_EPOLL_EVENTS 8
@@ -49,8 +52,10 @@ struct netstacklat_config {
 #define MAX_BAR_STRLEN (80 - 6 - MAX_BINSPAN_STRLEN - MAX_BINCOUNT_STRLEN)
 
 static const struct option long_options[] = {
-	{ "help",            no_argument,       NULL, 'h' },
-	{ "report-interval", required_argument, NULL, 'r' },
+	{ "help",              no_argument,       NULL, 'h' },
+	{ "report-interval",   required_argument, NULL, 'r' },
+	{ "histgram-exp-base", required_argument, NULL, 'b' },
+	{ "histogram-bins",    required_argument, NULL, 'n' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -164,6 +169,24 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 				return err;
 
 			conf->report_interval_s = fval;
+			break;
+		case 'b':
+			err = parse_bounded_double(
+				&fval, optarg, 1.001, 64,
+				optval_to_longopt(opt)->name);
+			if (err)
+				return err;
+
+			conf->histogram_exp_basis = fval;
+			break;
+		case 'n':
+			err = parse_bounded_double(
+				&fval, optarg, 2, HIST_MAX_BINS,
+				optval_to_longopt(opt)->name);
+			if (err)
+				return err;
+
+			conf->histogram_nbins = fval;
 			break;
 		case 'h': // help
 			print_usage(stdout, argv[0]);
@@ -298,41 +321,38 @@ static void print_histbar(FILE *stream, __u64 count, __u64 max_count)
 	fprintf(stream, "|");
 }
 
-static void print_log2hist(FILE *stream, int nbins, const __u64 hist[nbins],
-			   double multiplier)
+static void print_hist(FILE *stream, int nbins, const __u64 bin_limits[nbins],
+		       const __u64 bin_counts[nbins], double multiplier)
 {
 	int bin, start_bin, end_bin, max_bin, len;
 	double low_bound, high_bound, avg;
 	__u64 count = 0;
 	char *prefix;
 
-	start_bin = find_first_nonzero(nbins - 1, hist);
-	end_bin = find_last_nonzero(nbins - 1, hist);
-	max_bin = find_largest_bin(nbins - 1, hist);
+	start_bin = find_first_nonzero(nbins - 1, bin_counts);
+	end_bin = find_last_nonzero(nbins - 1, bin_counts);
+	max_bin = find_largest_bin(nbins - 1, bin_counts);
 
 	for (bin = max(0, start_bin); bin <= end_bin; bin++) {
-		low_bound = pow(2, bin - 1) * multiplier;
-		high_bound = pow(2, bin) * multiplier;
-
-		// First bin includes 0 (i.e. [0, 1] rather than (0.5, 1])
-		if (bin == 0)
-			low_bound = 0;
+		// First bin includes 0 (i.e [0, bin_limits[0]])
+		low_bound = bin == 0 ? 0 : bin_limits[bin - 1] * multiplier;
 		// Last bin includes all values too large for the second-last bin
-		if (bin == nbins - 2)
-			high_bound = INFINITY;
+		high_bound = bin == nbins - 2 ? INFINITY :
+						bin_limits[bin] * multiplier;
 
 		len = print_bin_interval(stream, low_bound, high_bound);
 		print_nchars(stream, ' ', max(0, MAX_BINSPAN_STRLEN - len) + 1);
-		fprintf(stream, "%*llu ", MAX_BINCOUNT_STRLEN, hist[bin]);
-		print_histbar(stream, hist[bin], max_bin);
+		fprintf(stream, "%*llu ", MAX_BINCOUNT_STRLEN, bin_counts[bin]);
+		print_histbar(stream, bin_counts[bin], max_bin);
 		fprintf(stream, "\n");
 
-		count += hist[bin];
+		count += bin_counts[bin];
 	}
 
 	// Final "bin" is the sum of all values in the histogram
 	if (count > 0) {
-		avg = ns_to_siprefix((double)hist[nbins - 1] / count, &prefix);
+		avg = ns_to_siprefix((double)bin_counts[nbins - 1] / count,
+				     &prefix);
 		fprintf(stream, "count: %llu, average: %.2f%ss\n", count, avg,
 			prefix);
 	} else {
@@ -355,9 +375,10 @@ static void merge_percpu_hist(int nbins, int ncpus,
 	}
 }
 
-static int fetch_hist_map(int map_fd, __u64 hist[HIST_NBINS])
+static int fetch_hist_map(int map_fd, __u64 hist[HIST_MAX_BINS + 1])
 {
-	__u32 in_batch, out_batch, count = HIST_NBINS;
+	// TODO - Replace HIST_MAX_BINS with actual number of configured bins
+	__u32 in_batch, out_batch, count = HIST_MAX_BINS + 1;
 	int ncpus = libbpf_num_possible_cpus();
 	__u32 idx, idxs_fetched = 0;
 	__u64 (*percpu_hist)[ncpus];
@@ -366,12 +387,12 @@ static int fetch_hist_map(int map_fd, __u64 hist[HIST_NBINS])
 
 	DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, batch_opts, .flags = BPF_EXIST);
 
-	percpu_hist = calloc(HIST_NBINS, sizeof(*percpu_hist));
-	keys = calloc(HIST_NBINS, sizeof(*keys));
+	percpu_hist = calloc(HIST_MAX_BINS + 1, sizeof(*percpu_hist));
+	keys = calloc(HIST_MAX_BINS + 1, sizeof(*keys));
 	if (!percpu_hist || !keys)
 		return -ENOMEM;
 
-	while (idxs_fetched < HIST_NBINS) {
+	while (idxs_fetched < HIST_MAX_BINS + 1) {
 		err = bpf_map_lookup_batch(map_fd,
 					   idxs_fetched > 0 ? &in_batch : NULL,
 					   &out_batch, keys + idxs_fetched,
@@ -392,10 +413,10 @@ static int fetch_hist_map(int map_fd, __u64 hist[HIST_NBINS])
 
 		in_batch = out_batch;
 		idxs_fetched += count;
-		count = HIST_NBINS - idxs_fetched;
+		count = HIST_MAX_BINS + 1 - idxs_fetched;
 	}
 
-	merge_percpu_hist(HIST_NBINS, ncpus, percpu_hist, hist);
+	merge_percpu_hist(HIST_MAX_BINS + 1, ncpus, percpu_hist, hist);
 
 exit:
 	free(percpu_hist);
@@ -403,10 +424,11 @@ exit:
 	return err;
 }
 
-static int report_stats(const struct netstacklat_bpf *obj)
+static int report_stats(const struct netstacklat_bpf *obj,
+			const struct netstacklat_config *conf)
 {
 	enum netstacklat_hook hook;
-	__u64 hist[HIST_NBINS] = { 0 };
+	__u64 hist[HIST_MAX_BINS + 1] = { 0 };
 	time_t t;
 	int err;
 
@@ -420,7 +442,8 @@ static int report_stats(const struct netstacklat_bpf *obj)
 		if (err)
 			return err;
 
-		print_log2hist(stdout, ARRAY_SIZE(hist), hist, 1);
+		print_hist(stdout, conf->histogram_nbins + 1,
+			   conf->histogram_bin_limits, hist, 1);
 		printf("\n");
 	}
 
@@ -532,7 +555,8 @@ static int setup_timer(__u64 interval_ns)
 	return fd;
 }
 
-static int handle_timer(int timer_fd, const struct netstacklat_bpf *obj)
+static int handle_timer(int timer_fd, const struct netstacklat_bpf *obj,
+			const struct netstacklat_config *conf)
 {
 	__u64 timer_exps;
 	ssize_t size;
@@ -549,7 +573,7 @@ static int handle_timer(int timer_fd, const struct netstacklat_bpf *obj)
 		fprintf(stderr, "Warning: Missed %llu reporting intervals\n",
 			timer_exps - 1);
 
-	return report_stats(obj);
+	return report_stats(obj, conf);
 }
 
 static int epoll_add_event(int epoll_fd, int fd, __u64 event_type, __u64 value)
@@ -589,7 +613,8 @@ err:
 	return err;
 }
 
-static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj)
+static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj,
+		       const struct netstacklat_config *conf)
 {
 	struct epoll_event events[MAX_EPOLL_EVENTS];
 	int i, n, fd, err = 0;
@@ -608,7 +633,7 @@ static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj)
 			err = handle_signal(fd);
 			break;
 		case NETSTACKLAT_EPOLL_TIMER:
-			err = handle_timer(fd, obj);
+			err = handle_timer(fd, obj, conf);
 			break;
 		default:
 			fprintf(stderr, "Warning: unexpected epoll data: %lu\n",
@@ -623,10 +648,32 @@ static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj)
 	return err;
 }
 
+static int calculate_histogram_binlimits(struct netstacklat_config *conf)
+{
+	double bin_limit = 1;
+	int i;
+
+	if (conf->histogram_nbins > HIST_MAX_BINS ||
+	    conf->histogram_exp_basis <= 1)
+		return -ERANGE;
+
+	for (i = 0; i < conf->histogram_nbins; i++) {
+		bin_limit = pow(conf->histogram_exp_basis, i);
+		if (bin_limit >= (1ULL << 63))
+			return -E2BIG;
+
+		conf->histogram_bin_limits[i] = bin_limit;
+	}
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	struct netstacklat_config config = {
 		.report_interval_s = 5,
+		.histogram_exp_basis = 2,
+		.histogram_nbins = 31,
 	};
 	int sig_fd, timer_fd, epoll_fd, sock_fd, err;
 	struct netstacklat_bpf *obj;
@@ -635,6 +682,13 @@ int main(int argc, char *argv[])
 	err = parse_arguments(argc, argv, &config);
 	if (err) {
 		fprintf(stderr, "Failed parsing arguments: %s\n",
+			strerror(-err));
+		return err;
+	}
+
+	err = calculate_histogram_binlimits(&config);
+	if (err) {
+		fprintf(stderr, "Invalid histogram configuration: %s\n",
 			strerror(-err));
 		return err;
 	}
@@ -657,6 +711,10 @@ int main(int argc, char *argv[])
 	}
 
 	obj->rodata->TAI_OFFSET = (signed long long)get_tai_offset() * NS_PER_S;
+	obj->rodata->HISTCONFIG_NBINS = config.histogram_nbins;
+	for (int i = 0; i < config.histogram_nbins; i++)
+		obj->rodata->HISTCONFIG_BIN_LIMITS[i] =
+			config.histogram_bin_limits[i];
 
 	err = netstacklat_bpf__load(obj);
 	if (err) {
@@ -697,12 +755,12 @@ int main(int argc, char *argv[])
 
 	// Report stats until user shuts down program
 	while (true) {
-		err = poll_events(epoll_fd, obj);
+		err = poll_events(epoll_fd, obj, &config);
 
 		if (err) {
 			if (err == NETSTACKLAT_ABORT) {
 				// Report stats a final time before terminating
-				report_stats(obj);
+				report_stats(obj, &config);
 				err = 0;
 			} else {
 				libbpf_strerror(err, errmsg, sizeof(errmsg));

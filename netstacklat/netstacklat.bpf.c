@@ -11,7 +11,10 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+// Constants set by userspace
 volatile const signed long long TAI_OFFSET = (37LL * NS_PER_S);
+volatile const unsigned long long HISTCONFIG_BIN_LIMITS[HIST_MAX_BINS] = { 0 };
+volatile const unsigned long HISTCONFIG_NBINS = HIST_MAX_BINS;
 
 /* Helpers in maps.bpf.h require any histogram key to be a struct with a bucket member */
 struct hist_key {
@@ -20,46 +23,64 @@ struct hist_key {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBINS);
+	__uint(max_entries, HIST_MAX_BINS + 1);
 	__type(key, u32);
 	__type(value, u64);
 } netstack_latency_tcp_v4_do_rcv_seconds SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBINS);
+	__uint(max_entries, HIST_MAX_BINS + 1);
 	__type(key, u32);
 	__type(value, u64);
 } netstack_latency_tcp_data_queue_seconds SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBINS);
+	__uint(max_entries, HIST_MAX_BINS + 1);
 	__type(key, u32);
 	__type(value, u64);
 } netstack_latency_udp_queue_rcv_seconds SEC(".maps");
 
-static u32 get_exp2_histogram_bin_idx(u64 value, u32 max_bin)
+/*
+ * Find the correct histogram bin index for val.
+ * Uses a binary search to search through all of the bin limits in
+ * HISTCONFIG_BIN_LIMITS and select the appropirate one. Creates a
+ * right-inclusive histogram, i.e. it will return index i for
+ * HISTCONFIG_BIN_LIMITS[i - 1] < val <= HISTCONFIG_BIN_LIMITS[i]. Values outside
+ * the histogram range will be placed in the first or last bin.
+ */
+static u32 search_histbin_idx(u64 val)
 {
-	u32 bin = log2l(value);
+	u32 low = 0, high = HISTCONFIG_NBINS - 1;
+	u32 mid;
 
-	// Right-inclusive histogram, so "round up" the log value
-	if (bin > 0 && 1 << bin < value)
-		bin++;
+	if (val <= HISTCONFIG_BIN_LIMITS[low])
+		return low;
+	if (val >= HISTCONFIG_BIN_LIMITS[high])
+		return high;
 
-	if (bin > max_bin)
-		bin = max_bin;
+	while (low < high - 1) {
+		mid = (low + high) / 2;
 
-	return bin;
+		if (val == HISTCONFIG_BIN_LIMITS[mid])
+			return mid;
+		if (val > HISTCONFIG_BIN_LIMITS[mid])
+			low = mid;
+		else
+			high = mid;
+	}
+
+	return high;
 }
 
-static void increment_exp2_histogram_nosync(void *map, struct hist_key key,
-					    u64 value, u32 max_bin)
+static void increment_histogram_nosync(void *map, struct hist_key key,
+				       u64 value)
 {
 	u64 *bin_count;
 
 	// Increment histogram
-	key.bucket = get_exp2_histogram_bin_idx(value, max_bin);
+	key.bucket = search_histbin_idx(value);
 	bin_count = bpf_map_lookup_elem(map, &key);
 	if (bin_count)
 		(*bin_count)++;
@@ -68,7 +89,7 @@ static void increment_exp2_histogram_nosync(void *map, struct hist_key key,
 	if (value == 0)
 		return;
 
-	key.bucket = max_bin + 1;
+	key.bucket = HISTCONFIG_NBINS;
 	bin_count = bpf_map_lookup_elem(map, &key);
 	if (bin_count)
 		*bin_count += value;
@@ -105,8 +126,7 @@ static void record_current_netstacklat(struct sk_buff *skb,
 	if (delta_ns < 0)
 		return;
 
-	increment_exp2_histogram_nosync(hook_to_histmap(hook), key, delta_ns,
-					HIST_MAX_LATENCY_SLOT);
+	increment_histogram_nosync(hook_to_histmap(hook), key, delta_ns);
 }
 
 SEC("fentry/tcp_v4_do_rcv")
