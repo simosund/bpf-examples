@@ -181,12 +181,24 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 static const char *hook_to_str(enum netstacklat_hook hook)
 {
 	switch (hook) {
+	case NETSTACKLAT_HOOK_NETIF_RECEIVE_SKB:
+		return "netif_receive_skb";
+	case NETSTACKLAT_HOOK_TCF_CLASSIFY:
+		return "tcf_classify";
+	case NETSTACKLAT_HOOK_NF_CONNTRACK_IN:
+		return "nf_conntrack_in";
+	case NETSTACKLAT_HOOK_IPT_DO_TABLE:
+		return "ipt_do_table";
 	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV:
 		return "tcp_v4_do_rcv";
 	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE:
 		return "tcp_data_queue";
 	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE:
 		return "udp_queue_rcv_one_skb";
+	case NETSTACKLAT_HOOK_TCP_RECVMSG:
+		return "tcp_recvmsg";
+	case NETSTACKLAT_HOOK_UDP_RECVMSG:
+		return "udp_recvmsg";
 	default:
 		return "invalid";
 	}
@@ -196,6 +208,18 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 			   const struct netstacklat_bpf *obj)
 {
 	switch (hook) {
+	case NETSTACKLAT_HOOK_NETIF_RECEIVE_SKB:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_netif_receive_skb_seconds);
+	case NETSTACKLAT_HOOK_TCF_CLASSIFY:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_tcf_classify_seconds);
+	case NETSTACKLAT_HOOK_NF_CONNTRACK_IN:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_nf_conntrack_in_seconds);
+	case NETSTACKLAT_HOOK_IPT_DO_TABLE:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_ipt_do_table_seconds);
 	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV:
 		return bpf_map__fd(
 			obj->maps.netstack_latency_tcp_v4_do_rcv_seconds);
@@ -205,6 +229,12 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE:
 		return bpf_map__fd(
 			obj->maps.netstack_latency_udp_queue_rcv_seconds);
+	case NETSTACKLAT_HOOK_TCP_RECVMSG:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_tcp_recvmsg_seconds);
+	case NETSTACKLAT_HOOK_UDP_RECVMSG:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_udp_recvmsg_seconds);
 	default:
 		return -EINVAL;
 	}
