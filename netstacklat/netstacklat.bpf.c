@@ -133,21 +133,32 @@ static void *hook_to_histmap(enum netstacklat_hook hook)
 	}
 }
 
-static void record_latency_since(ktime_t tstamp, enum netstacklat_hook hook)
+static ktime_t time_since(ktime_t tstamp)
 {
-	struct hist_key key = { 0 };
-	ktime_t delta, now;
+	ktime_t now;
 
 	if (tstamp <= 0)
-		return;
+		return -1;
 
 	now = bpf_ktime_get_tai_ns() - TAI_OFFSET;
 	if (tstamp > now)
-		return;
+		return -1;
 
-	delta = now - tstamp;
-	increment_exp2_histogram_nosync(hook_to_histmap(hook), key, delta,
+	return now - tstamp;
+}
+
+static void record_latency(ktime_t latency, enum netstacklat_hook hook)
+{
+	struct hist_key key = { 0 };
+	increment_exp2_histogram_nosync(hook_to_histmap(hook), key, latency,
 					HIST_MAX_LATENCY_SLOT);
+}
+
+static void record_latency_since(ktime_t tstamp, enum netstacklat_hook hook)
+{
+	ktime_t latency = time_since(tstamp);
+	if (latency >= 0)
+		record_latency(latency, hook);
 }
 
 SEC("fentry/ip_rcv_core")
