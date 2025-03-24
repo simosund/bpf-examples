@@ -13,6 +13,7 @@
 #define HIST_NBINS (HIST_MAX_LATENCY_SLOT + 2)
 
 #define NS_PER_S 1000000000
+#define NS_PER_MS 1000000
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
@@ -37,7 +38,15 @@ enum netstacklat_hook {
 	NETSTACKLAT_HOOK_UDP_SOCK_QUEUE,
 	NETSTACKLAT_HOOK_TCP_SOCK_READ,
 	NETSTACKLAT_HOOK_UDP_SOCK_READ,
+	NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE,
 	NETSTACKLAT_N_HOOKS,
+};
+
+struct netstacklat_bpf_config
+{
+	__u64 interval;
+	__u64 target;
+	bool persist_through_empty;
 };
 
 #endif

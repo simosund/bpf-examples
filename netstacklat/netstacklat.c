@@ -52,16 +52,20 @@ struct hook_prog_collection {
 };
 
 struct netstacklat_config {
+	struct netstacklat_bpf_config bpf_conf;
 	double report_interval_s;
 	bool enabled_hooks[NETSTACKLAT_N_HOOKS];
 };
 
 static const struct option long_options[] = {
-	{ "help",            no_argument,       NULL, 'h' },
-	{ "report-interval", required_argument, NULL, 'r' },
-	{ "list-probes",     no_argument,       NULL, 'l' },
-	{ "enable-probe",    required_argument, NULL, 'e' },
-	{ "disable-probe",   required_argument, NULL, 'd' },
+	{ "help",                    no_argument,       NULL, 'h' },
+	{ "report-interval",         required_argument, NULL, 'r' },
+	{ "list-probes",             no_argument,       NULL, 'l' },
+	{ "enable-probe",            required_argument, NULL, 'e' },
+	{ "disable-probe",           required_argument, NULL, 'd' },
+	{ "standing-queue-target",   required_argument, NULL, 't' },
+	{ "standing-queue-interval", required_argument, NULL, 'i' },
+	{ "standing-queue-noempty",  no_argument,       NULL, 'n' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -145,6 +149,8 @@ static const char *hook_to_str(enum netstacklat_hook hook)
 		return "tcp-sock-read";
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
 		return "udp-sock-read";
+	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
+		return "socket-standing-queue";
 	default:
 		return "invalid";
 	}
@@ -181,6 +187,8 @@ static const char *hook_to_description(enum netstacklat_hook hook)
 		return "packet payload has been read from TCP socket, i.e. delivered to user space";
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
 		return "packet payload has been read from UDP socket, i.e. delivered to user space";
+	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
+		return "duration the socket read latency has constantly exceeded the target";
 	default:
 		return "not a valid hook";
 	}
@@ -213,6 +221,9 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
 		return bpf_map__fd(
 			obj->maps.netstack_latency_udp_sock_read_seconds);
+	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
+		return bpf_map__fd(
+			obj->maps.netstack_sock_standingqueue_seconds);
 	default:
 		return -EINVAL;
 	}
@@ -261,6 +272,11 @@ static void hook_to_progs(struct hook_prog_collection *progs,
 		progs->progs[0] = obj->progs.netstacklat_skb_consume_udp;
 		progs->nprogs = 1;
 		break;
+	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
+		// TODO - figure out how to handle the dependency on {tcp,udp}-sock-read
+		// This is a bit of a pseudo-hook, with no programs on its own
+		// Maybe this shouldn't be its own hook at all, rather some separate thing?
+		progs->nprogs = 0;
 	default:
 		progs->nprogs = 0;
 		break;
@@ -387,6 +403,23 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 			for (i = 1; i < NETSTACKLAT_N_HOOKS; i++)
 				conf->enabled_hooks[i] = !hooks[i];
 			hooks_off = true;
+			break;
+		case 't': // standing-queue-target
+			err = parse_bounded_double(&fval, optarg, 0.001, 10000, optval_to_longopt(opt)->name);
+			if (err)
+				return err;
+
+			conf->bpf_conf.target = fval * NS_PER_MS;
+			break;
+		case 'i': // standing-queue-interval
+			err = parse_bounded_double(&fval, optarg, 0.001, 10000, optval_to_longopt(opt)->name);
+			if (err)
+				return err;
+
+			conf->bpf_conf.interval = fval * NS_PER_MS;
+			break;
+		case 'n': // standing-queue-noempty
+			conf->bpf_conf.persist_through_empty = true;
 			break;
 		case 'h': // help
 			print_usage(stdout, argv[0]);
@@ -849,6 +882,11 @@ int main(int argc, char *argv[])
 {
 	int sig_fd, timer_fd, epoll_fd, sock_fd, err;
 	struct netstacklat_config config = {
+		.bpf_conf = {
+			.interval = 10 * NS_PER_MS,
+			.target = 1 * NS_PER_MS,
+			.persist_through_empty = false,
+		},
 		.report_interval_s = 5,
 	};
 	struct netstacklat_bpf *obj;
@@ -879,6 +917,7 @@ int main(int argc, char *argv[])
 	}
 
 	obj->rodata->TAI_OFFSET = (signed long long)get_tai_offset() * NS_PER_S;
+	obj->rodata->user_config = config.bpf_conf;
 
 	set_programs_to_load(&config, obj);
 

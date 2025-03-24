@@ -149,4 +149,141 @@ struct scm_timestamping_internal {
         struct timespec64 ts[3];
 };
 
+struct sk_buff_list {
+	struct sk_buff *next;
+	struct sk_buff *prev;
+};
+
+struct sk_buff_head {
+	union {
+		struct {
+			struct sk_buff *next;
+			struct sk_buff *prev;
+		};
+		struct sk_buff_list list;
+	};
+	__u32 qlen;
+	/* spinlock_t lock; */
+};
+
+struct sock {
+	/* struct sock_common __sk_common; */
+	/* __u8 __cacheline_group_begin__sock_write_rx[0]; */
+	/* atomic_t sk_drops; */
+	/* __s32 sk_peek_off; */
+	struct sk_buff_head sk_error_queue;
+	struct sk_buff_head sk_receive_queue;
+	/* struct { */
+	/* 	atomic_t rmem_alloc; */
+	/* 	int len; */
+	/* 	struct sk_buff *head; */
+	/* 	struct sk_buff *tail; */
+	/* } sk_backlog; */
+	/* __u8 __cacheline_group_end__sock_write_rx[0]; */
+	/* __u8 __cacheline_group_begin__sock_read_rx[0]; */
+	/* struct dst_entry *sk_rx_dst; */
+	/* int sk_rx_dst_ifindex; */
+	/* u32 sk_rx_dst_cookie; */
+	/* unsigned int sk_ll_usec; */
+	/* unsigned int sk_napi_id; */
+	/* u16 sk_busy_poll_budget; */
+	/* u8 sk_prefer_busy_poll; */
+	/* u8 sk_userlocks; */
+	/* int sk_rcvbuf; */
+	/* struct sk_filter *sk_filter; */
+	/* union { */
+	/* 	struct socket_wq *sk_wq; */
+	/* 	struct socket_wq *sk_wq_raw; */
+	/* }; */
+	/* void (*sk_data_ready)(struct sock *); */
+	/* long int sk_rcvtimeo; */
+	/* int sk_rcvlowat; */
+	/* __u8 __cacheline_group_end__sock_read_rx[0]; */
+	/* __u8 __cacheline_group_begin__sock_read_rxtx[0]; */
+	/* int sk_err; */
+	/* struct socket *sk_socket; */
+	/* struct mem_cgroup *sk_memcg; */
+	/* struct xfrm_policy *sk_policy[2]; */
+	/* __u8 __cacheline_group_end__sock_read_rxtx[0]; */
+	/* __u8 __cacheline_group_begin__sock_write_rxtx[0]; */
+	/* socket_lock_t sk_lock; */
+	/* u32 sk_reserved_mem; */
+	/* int sk_forward_alloc; */
+	/* u32 sk_tsflags; */
+	/* __u8 __cacheline_group_end__sock_write_rxtx[0]; */
+	/* __u8 __cacheline_group_begin__sock_write_tx[0]; */
+	/* int sk_write_pending; */
+	/* atomic_t sk_omem_alloc; */
+	/* int sk_sndbuf; */
+	/* int sk_wmem_queued; */
+	/* refcount_t sk_wmem_alloc; */
+	/* long unsigned int sk_tsq_flags; */
+	/* union { */
+	/* 	struct sk_buff *sk_send_head; */
+	/* 	struct rb_root tcp_rtx_queue; */
+	/* }; */
+	/* struct sk_buff_head sk_write_queue; */
+	/* u32 sk_dst_pending_confirm; */
+	/* u32 sk_pacing_status; */
+	/* struct page_frag sk_frag; */
+	/* struct timer_list sk_timer; */
+	/* long unsigned int sk_pacing_rate; */
+	/* atomic_t sk_zckey; */
+	/* atomic_t sk_tskey; */
+	/* __u8 __cacheline_group_end__sock_write_tx[0]; */
+	/* __u8 __cacheline_group_begin__sock_read_tx[0]; */
+	/* long unsigned int sk_max_pacing_rate; */
+	/* long int sk_sndtimeo; */
+	/* u32 sk_priority; */
+	/* u32 sk_mark; */
+	/* struct dst_entry *sk_dst_cache; */
+	/* netdev_features_t sk_route_caps; */
+	/* u16 sk_gso_type; */
+	/* u16 sk_gso_max_segs; */
+	/* unsigned int sk_gso_max_size; */
+	/* gfp_t sk_allocation; */
+	/* u32 sk_txhash; */
+	/* u8 sk_pacing_shift; */
+	/* bool sk_use_task_frag; */
+	/* __u8 __cacheline_group_end__sock_read_tx[0]; */
+	/* u8 sk_gso_disabled : 1; */
+	/* u8 sk_kern_sock : 1; */
+	/* u8 sk_no_check_tx : 1; */
+	/* u8 sk_no_check_rx : 1; */
+	/* u8 sk_shutdown; */
+	/* u16 sk_type; */
+	/* u16 sk_protocol; */
+	/* long unsigned int sk_lingertime; */
+	/* struct proto *sk_prot_creator; */
+	/* rwlock_t sk_callback_lock; */
+	/* int sk_err_soft; */
+	/* u32 sk_ack_backlog; */
+	/* u32 sk_max_ack_backlog; */
+	/* kuid_t sk_uid; */
+	/* spinlock_t sk_peer_lock; */
+	/* int sk_bind_phc; */
+	/* struct pid *sk_peer_pid; */
+	/* const struct cred *sk_peer_cred; */
+	/* ktime_t sk_stamp; */
+	/* int sk_disconnects; */
+	/* u8 sk_txrehash; */
+	/* u8 sk_clockid; */
+	/* u8 sk_txtime_deadline_mode : 1; */
+	/* u8 sk_txtime_report_errors : 1; */
+	/* u8 sk_txtime_unused : 6; */
+	/* void *sk_user_data; */
+	/* void *sk_security; */
+	/* struct sock_cgroup_data sk_cgrp_data; */
+	/* void (*sk_state_change)(struct sock *); */
+	/* void (*sk_write_space)(struct sock *); */
+	/* void (*sk_error_report)(struct sock *); */
+	/* int (*sk_backlog_rcv)(struct sock *, struct sk_buff *); */
+	/* void (*sk_destruct)(struct sock *); */
+	/* struct sock_reuseport *sk_reuseport_cb; */
+	/* struct bpf_local_storage *sk_bpf_storage; */
+	/* struct callback_head sk_rcu; */
+	/* netns_tracker ns_tracker; */
+	/* struct xarray sk_user_frags; */
+};
+
 #endif /* __VMLINUX_NET_H__ */
