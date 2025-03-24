@@ -23,21 +23,56 @@ struct {
 	__uint(max_entries, HIST_NBINS);
 	__type(key, u32);
 	__type(value, u64);
-} netstack_latency_tcp_v4_do_rcv_seconds SEC(".maps");
+} netstack_latency_ip_start_seconds SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, HIST_NBINS);
 	__type(key, u32);
 	__type(value, u64);
-} netstack_latency_tcp_data_queue_seconds SEC(".maps");
+} netstack_latency_conntrack_seconds SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, HIST_NBINS);
 	__type(key, u32);
 	__type(value, u64);
-} netstack_latency_udp_queue_rcv_seconds SEC(".maps");
+} netstack_latency_tcp_start_seconds SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBINS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_latency_udp_start_seconds SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBINS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_latency_tcp_sock_queue_seconds SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBINS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_latency_udp_sock_queue_seconds SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBINS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_latency_tcp_sock_read_seconds SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBINS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_latency_udp_sock_read_seconds SEC(".maps");
 
 static u32 get_exp2_histogram_bin_idx(u64 value, u32 max_bin)
 {
@@ -77,12 +112,22 @@ static void increment_exp2_histogram_nosync(void *map, struct hist_key key,
 static void *hook_to_histmap(enum netstacklat_hook hook)
 {
 	switch (hook) {
-	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV:
-		return &netstack_latency_tcp_v4_do_rcv_seconds;
-	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE:
-		return &netstack_latency_tcp_data_queue_seconds;
-	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE:
-		return &netstack_latency_udp_queue_rcv_seconds;
+	case NETSTACKLAT_HOOK_IP_RCV:
+		return &netstack_latency_ip_start_seconds;
+	case NETSTACKLAT_HOOK_CONNTRACK:
+		return &netstack_latency_conntrack_seconds;
+	case NETSTACKLAT_HOOK_TCP_START:
+		return &netstack_latency_tcp_start_seconds;
+	case NETSTACKLAT_HOOK_UDP_START:
+		return &netstack_latency_udp_start_seconds;
+	case NETSTACKLAT_HOOK_TCP_SOCK_QUEUE:
+		return &netstack_latency_tcp_sock_queue_seconds;
+	case NETSTACKLAT_HOOK_UDP_SOCK_QUEUE:
+		return &netstack_latency_udp_sock_queue_seconds;
+	case NETSTACKLAT_HOOK_TCP_SOCK_READ:
+		return &netstack_latency_tcp_sock_read_seconds;
+	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
+		return &netstack_latency_udp_sock_read_seconds;
 	default:
 		return NULL;
 	}
@@ -105,23 +150,103 @@ static void record_latency_since(ktime_t tstamp, enum netstacklat_hook hook)
 					HIST_MAX_LATENCY_SLOT);
 }
 
-SEC("fentry/tcp_v4_do_rcv")
-int BPF_PROG(netstacklat_tcp_v4_do_rcv, struct sock *sk, struct sk_buff *skb)
+SEC("fentry/ip_rcv_core")
+int BPF_PROG(netstacklat_ip_rcv_core, struct sk_buff *skb, void *block,
+	     void *tp, void *res, bool compat_mode)
 {
-	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_TCP_V4_DO_RCV);
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_IP_RCV);
 	return 0;
 }
 
-SEC("fentry/tcp_data_queue")
+SEC("fentry/ip6_rcv_core")
+int BPF_PROG(netstacklat_ip6_rcv_core, struct sk_buff *skb, void *block,
+	     void *tp, void *res, bool compat_mode)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_IP_RCV);
+	return 0;
+}
+
+SEC("fexit/ipv4_conntrack_in")
+int BPF_PROG(netstacklat_ipv4_conntrack_in, void *priv, struct sk_buff *skb,
+	     void *state)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_CONNTRACK);
+	return 0;
+}
+
+SEC("fexit/ipv6_conntrack_in")
+int BPF_PROG(netstacklat_ipv6_conntrack_in, void *priv, struct sk_buff *skb,
+	     void *state)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_CONNTRACK);
+	return 0;
+}
+
+SEC("fentry/tcp_v4_rcv")
+int BPF_PROG(netstacklat_tcp_v4_rcv, struct sk_buff *skb)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_TCP_START);
+	return 0;
+}
+
+SEC("fentry/tcp_v6_rcv")
+int BPF_PROG(netstacklat_tcp_v6_rcv, struct sk_buff *skb)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_TCP_START);
+	return 0;
+}
+
+SEC("fentry/udp_rcv")
+int BPF_PROG(netstacklat_udp_rcv, struct sk_buff *skb)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_UDP_START);
+	return 0;
+}
+
+SEC("fentry/udpv6_rcv")
+int BPF_PROG(netstacklat_udpv6_rcv, struct sk_buff *skb)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_UDP_START);
+	return 0;
+}
+
+SEC("fexit/tcp_data_queue")
 int BPF_PROG(netstacklat_tcp_data_queue, struct sock *sk, struct sk_buff *skb)
 {
-	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_TCP_DATA_QUEUE);
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_TCP_SOCK_QUEUE);
 	return 0;
 }
 
-SEC("fentry/udp_queue_rcv_one_skb")
-int BPF_PROG(netstacklat_udp_queue_rcv, struct sock *sk, struct sk_buff *skb)
+SEC("fexit/udp_queue_rcv_one_skb")
+int BPF_PROG(netstacklat_udp_queue_rcv_one_skb, struct sock *sk,
+	     struct sk_buff *skb)
 {
-	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE);
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_UDP_SOCK_QUEUE);
+	return 0;
+}
+
+SEC("fexit/udpv6_queue_rcv_one_skb")
+int BPF_PROG(netstacklat_udpv6_queue_rcv_one_skb, struct sock *sk,
+	     struct sk_buff *skb)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_UDP_SOCK_QUEUE);
+	return 0;
+}
+
+SEC("fentry/tcp_recv_timestamp")
+int BPF_PROG(netstacklat_tcp_recv_timestamp, void *msg, struct sock *sk,
+	     struct scm_timestamping_internal *tss)
+{
+	struct timespec64 *ts = &tss->ts[0];
+	record_latency_since((ktime_t)ts->tv_sec * NS_PER_S + ts->tv_nsec,
+			     NETSTACKLAT_HOOK_TCP_SOCK_READ);
+	return 0;
+}
+
+SEC("fentry/skb_consume_udp")
+int BPF_PROG(netstacklat_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
+	     int len)
+{
+	record_latency_since(skb->tstamp, NETSTACKLAT_HOOK_UDP_SOCK_READ);
 	return 0;
 }

@@ -118,12 +118,22 @@ static void print_usage(FILE *stream, const char *prog_name)
 static const char *hook_to_str(enum netstacklat_hook hook)
 {
 	switch (hook) {
-	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV:
-		return "tcp_v4_do_rcv";
-	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE:
-		return "tcp_data_queue";
-	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE:
-		return "udp_queue_rcv_one_skb";
+	case NETSTACKLAT_HOOK_IP_RCV:
+		return "ip-start";
+	case NETSTACKLAT_HOOK_CONNTRACK:
+		return "conntrack";
+	case NETSTACKLAT_HOOK_TCP_START:
+		return "tcp-start";
+	case NETSTACKLAT_HOOK_UDP_START:
+		return "udp-start";
+	case NETSTACKLAT_HOOK_TCP_SOCK_QUEUE:
+		return "tcp-socket-queued";
+	case NETSTACKLAT_HOOK_UDP_SOCK_QUEUE:
+		return "udp-socket-queued";
+	case NETSTACKLAT_HOOK_TCP_SOCK_READ:
+		return "tcp-sock-read";
+	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
+		return "udp-sock-read";
 	default:
 		return "invalid";
 	}
@@ -133,15 +143,29 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 			   const struct netstacklat_bpf *obj)
 {
 	switch (hook) {
-	case NETSTACKLAT_HOOK_TCP_V4_DO_RCV:
+	case NETSTACKLAT_HOOK_IP_RCV:
+		return bpf_map__fd(obj->maps.netstack_latency_ip_start_seconds);
+	case NETSTACKLAT_HOOK_CONNTRACK:
 		return bpf_map__fd(
-			obj->maps.netstack_latency_tcp_v4_do_rcv_seconds);
-	case NETSTACKLAT_HOOK_TCP_DATA_QUEUE:
+			obj->maps.netstack_latency_conntrack_seconds);
+	case NETSTACKLAT_HOOK_TCP_START:
 		return bpf_map__fd(
-			obj->maps.netstack_latency_tcp_data_queue_seconds);
-	case NETSTACKLAT_HOOK_UDP_QUEUE_RCV_ONE:
+			obj->maps.netstack_latency_tcp_start_seconds);
+	case NETSTACKLAT_HOOK_UDP_START:
 		return bpf_map__fd(
-			obj->maps.netstack_latency_udp_queue_rcv_seconds);
+			obj->maps.netstack_latency_udp_start_seconds);
+	case NETSTACKLAT_HOOK_TCP_SOCK_QUEUE:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_tcp_sock_queue_seconds);
+	case NETSTACKLAT_HOOK_UDP_SOCK_QUEUE:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_udp_sock_queue_seconds);
+	case NETSTACKLAT_HOOK_TCP_SOCK_READ:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_tcp_sock_read_seconds);
+	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
+		return bpf_map__fd(
+			obj->maps.netstack_latency_udp_sock_read_seconds);
 	default:
 		return -EINVAL;
 	}

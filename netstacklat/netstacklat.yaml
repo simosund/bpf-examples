@@ -1,7 +1,7 @@
 metrics:
   histograms:
-    - name: netstack_latency_tcp_v4_do_rcv_seconds
-      help: Netstack latency up to the tcp_v4_do_rcv() function
+    - name: netstack_latency_ip_start_seconds
+      help: Time for packet to reach the start of the IP-stack
       bucket_type: exp2
       bucket_min: 0
       bucket_max: 30
@@ -11,8 +11,8 @@ metrics:
           size: 4
           decoders:
             - name: uint
-    - name: netstack_latency_tcp_data_queue_seconds
-      help: Netstack latency up to the tcp_data_queue() function
+    - name: netstack_latency_conntrack_seconds
+      help: Time until packet has passed conntrack
       bucket_type: exp2
       bucket_min: 0
       bucket_max: 30
@@ -22,8 +22,63 @@ metrics:
           size: 4
           decoders:
             - name: uint
-    - name: netstack_latency_udp_queue_rcv_seconds
-      help: Netstack latency up to the udp_queue_rcv_one_skb() function
+    - name: netstack_latency_tcp_start_seconds
+      help: Time for packet to reach the start of the TCP stack
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_latency_udp_start_seconds
+      help: Time until packet to reach the start of the UDP stack
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_latency_tcp_sock_queue_seconds
+      help: Time until packet is queued to TCP socket
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_latency_udp_sock_queue_seconds
+      help: Time until packet is queued to UDP socket
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_latency_tcp_sock_read_seconds
+      help: Time until packet data is read from TCP socket
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 30
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_latency_udp_sock_read_seconds
+      help: Time until packet data is read from UDP socket
       bucket_type: exp2
       bucket_min: 0
       bucket_max: 30
