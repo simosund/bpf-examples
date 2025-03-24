@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+static const char *__doc__ =
+	"Netstacklat - Monitor latency to various points in the ingress network stack";
+
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
 #include <math.h>
+#include <getopt.h>
+#include <ctype.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
@@ -40,6 +45,73 @@ struct netstacklat_config {
 	double report_interval_s;
 };
 
+static const struct option long_options[] = {
+	{ "help",            no_argument,       NULL, 'h' },
+	{ "report-interval", required_argument, NULL, 'r' },
+	{ 0, 0, 0, 0 }
+};
+
+static const struct option *optval_to_longopt(int val)
+{
+	int i;
+
+	for (i = 0; long_options[i].name != 0; i++) {
+		if (long_options[i].val == val)
+			return &long_options[i];
+	}
+
+	return NULL;
+}
+
+static int generate_optstr(char *buf, size_t size)
+{
+	int i, optlen, strlen = 0;
+	char optstr[4];
+
+	for (i = 0; long_options[i].name != 0; i++) {
+		if (long_options[i].flag || !isalnum(long_options[i].val))
+			continue;
+
+		optlen = snprintf(
+			optstr, sizeof(optstr), "%c%s", long_options[i].val,
+			long_options[i].has_arg == optional_argument ? "::" :
+			long_options[i].has_arg == required_argument ? ":" :
+								       "");
+		if (strlen + optlen < size) {
+			strncpy(buf + strlen, optstr, optlen + 1);
+		}
+		strlen += optlen;
+	}
+
+	return strlen + 1;
+}
+
+static void print_usage(FILE *stream, const char *prog_name)
+{
+	int i;
+
+	fprintf(stream, "\nDOCUMENTATION:\n%s\n", __doc__);
+	fprintf(stream, "\n");
+	fprintf(stream, " Usage: %s (options-see-below)\n", prog_name);
+	fprintf(stream, " Listing options:\n");
+	for (i = 0; long_options[i].name != 0; i++) {
+		if (!long_options[i].flag && isalnum(long_options[i].val))
+			fprintf(stream, " -%c, ", long_options[i].val);
+		else
+			fprintf(stream, "     ");
+
+		printf(" --%s", long_options[i].name);
+
+		if (long_options[i].has_arg == required_argument)
+			fprintf(stream, " <ARG>");
+		else if (long_options[i].has_arg == optional_argument)
+			fprintf(stream, "[ARG]");
+
+		fprintf(stream, "\n");
+	}
+	printf("\n");
+}
+
 static const char *hook_to_str(enum netstacklat_hook hook)
 {
 	switch (hook) {
@@ -70,6 +142,68 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 	default:
 		return -EINVAL;
 	}
+}
+
+static int parse_bounded_double(double *res, const char *str, double low,
+				double high, const char *name)
+{
+	char *endptr;
+	errno = 0;
+
+	*res = strtod(str, &endptr);
+	if (endptr == str || strlen(str) != endptr - str) {
+		fprintf(stderr, "%s %s is not a valid number\n", name, str);
+		return -EINVAL;
+	}
+
+	if (errno == ERANGE) {
+		fprintf(stderr, "%s %s overflowed\n", name, str);
+		return -ERANGE;
+	}
+
+	if (*res < low || *res > high) {
+		fprintf(stderr, "%s must be in range [%g, %g]\n", name, low, high);
+		return -ERANGE;
+	}
+
+	return 0;
+}
+
+int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
+{
+	char optstr[64];
+	int opt, err;
+	double fval;
+
+	if (generate_optstr(optstr, sizeof(optstr)) > sizeof(optstr)) {
+		fprintf(stderr,
+			"Internal error: optstr too short to fit all long_options\n");
+		return -ENAMETOOLONG;
+	}
+
+	while ((opt = getopt_long(argc, argv, optstr, long_options,
+				  NULL)) != -1) {
+		switch (opt) {
+		case 'r': // report interval
+			err = parse_bounded_double(
+				&fval, optarg, 0.01, 3600 * 24,
+				optval_to_longopt(opt)->name);
+			if (err)
+				return err;
+
+			conf->report_interval_s = fval;
+			break;
+		case 'h': // help
+			print_usage(stdout, argv[0]);
+			exit(EXIT_SUCCESS);
+		default:
+			// unrecognized option reported by getopt, so just print usage
+			print_usage(stderr, argv[0]);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
 }
 
 static int find_first_nonzero(int nbins, const __u64 hist[nbins])
@@ -455,9 +589,16 @@ int main(int argc, char *argv[])
 	struct netstacklat_config config = {
 		.report_interval_s = 5,
 	};
-	int sig_fd, timer_fd, epoll_fd, err = 0;
+	int sig_fd, timer_fd, epoll_fd, err;
 	struct netstacklat_bpf *obj;
 	char errmsg[128];
+
+	err = parse_arguments(argc, argv, &config);
+	if (err) {
+		fprintf(stderr, "Failed parsing arguments: %s\n",
+			strerror(-err));
+		return EXIT_FAILURE;
+	}
 
 	obj = netstacklat_bpf__open_and_load();
 	if (!obj) {
