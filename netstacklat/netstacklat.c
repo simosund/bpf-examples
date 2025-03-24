@@ -51,6 +51,7 @@ struct netstacklat_config {
 static const struct option long_options[] = {
 	{ "help",            no_argument,       NULL, 'h' },
 	{ "report-interval", required_argument, NULL, 'r' },
+	{ "list-probes",     no_argument,       NULL, 'l' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -137,6 +138,28 @@ static const char *hook_to_str(enum netstacklat_hook hook)
 	}
 }
 
+static const char *hook_to_description(enum netstacklat_hook hook)
+{
+	switch (hook) {
+	case NETSTACKLAT_HOOK_IP_RCV:
+		return "packet has reached the IP-stack, i.e. past the traffic control layer";
+	case NETSTACKLAT_HOOK_TCP_START:
+		return "packet has reached the local TCP-stack, i.e. past the IP (and routing) stack";
+	case NETSTACKLAT_HOOK_UDP_START:
+		return "packet has reached the local UDP-stack, i.e. past the IP (and routing) stack";
+	case NETSTACKLAT_HOOK_TCP_SOCK_ENQUEUED:
+		return "packet has been enqueued to a TCP socket, i.e. end of the kernel receive stack";
+	case NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED:
+		return "packed has been enqueued to a UDP socket, i.e. end of the kernel receive stack";
+	case NETSTACKLAT_HOOK_TCP_SOCK_READ:
+		return "packet payload has been read from TCP socket, i.e. delivered to user space";
+	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
+		return "packet payload has been read from UDP socket, i.e. delivered to user space";
+	default:
+		return "not a valid hook";
+	}
+}
+
 static int hook_to_histmap(enum netstacklat_hook hook,
 			   const struct netstacklat_bpf *obj)
 {
@@ -164,6 +187,16 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 	default:
 		return -EINVAL;
 	}
+}
+
+static void list_hooks(FILE *stream)
+{
+	enum netstacklat_hook hook;
+
+	fprintf(stream, "available hooks:\n");
+	for (hook = 1; hook < NETSTACKLAT_N_HOOKS; hook++)
+		fprintf(stream, "  %s: %s\n", hook_to_str(hook),
+			hook_to_description(hook));
 }
 
 static int parse_bounded_double(double *res, const char *str, double low,
@@ -215,6 +248,9 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 
 			conf->report_interval_s = fval;
 			break;
+		case 'l': // list-probes
+			list_hooks(stdout);
+			exit(EXIT_SUCCESS);
 		case 'h': // help
 			print_usage(stdout, argv[0]);
 			exit(EXIT_SUCCESS);
