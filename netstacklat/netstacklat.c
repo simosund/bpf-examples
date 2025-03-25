@@ -66,6 +66,7 @@ static const struct option long_options[] = {
 	{ "standing-queue-target",   required_argument, NULL, 't' },
 	{ "standing-queue-interval", required_argument, NULL, 'i' },
 	{ "standing-queue-noempty",  no_argument,       NULL, 'n' },
+	{ "filter-pid",              required_argument, NULL, 'p' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -151,6 +152,8 @@ static const char *hook_to_str(enum netstacklat_hook hook)
 		return "udp-sock-read";
 	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
 		return "socket-standing-queue";
+	case NETSTACKLAT_HOOK_PIDMATCH:
+		return "pid-matching";
 	default:
 		return "invalid";
 	}
@@ -189,6 +192,8 @@ static const char *hook_to_description(enum netstacklat_hook hook)
 		return "packet payload has been read from UDP socket, i.e. delivered to user space";
 	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
 		return "duration the socket read latency has constantly exceeded the target";
+	case NETSTACKLAT_HOOK_PIDMATCH:
+		return "debug - time for checking if pid matches filter";
 	default:
 		return "not a valid hook";
 	}
@@ -224,6 +229,8 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
 		return bpf_map__fd(
 			obj->maps.netstack_sock_standingqueue_seconds);
+	case NETSTACKLAT_HOOK_PIDMATCH:
+		return bpf_map__fd(obj->maps.netstack_pidmatch);
 	default:
 		return -EINVAL;
 	}
@@ -318,6 +325,32 @@ static int parse_bounded_double(double *res, const char *str, double low,
 	return 0;
 }
 
+static int parse_bounded_long(long long *res, const char *str, long long low,
+			      long long high, const char *name)
+{
+	char *endptr;
+	errno = 0;
+
+	*res = strtoll(str, &endptr, 10);
+	if (endptr == str || strlen(str) != endptr - str) {
+		fprintf(stderr, "%s %s is not a valid integer\n", name, str);
+		return -EINVAL;
+	}
+
+	if (errno == ERANGE) {
+		fprintf(stderr, "%s %s overflowed\n", name, str);
+		return -ERANGE;
+	}
+
+	if (*res < low || *res > high) {
+		fprintf(stderr, "%s must be in range [%lld, %lld]\n", name, low,
+			high);
+		return -ERANGE;
+	}
+
+	return 0;
+}
+
 /*
  * Parses a comma-delimited string of hook-names, and sets the positions for
  * the hooks that appear in the string to true.
@@ -351,6 +384,39 @@ static int parse_hooks(bool hooks[NETSTACKLAT_N_HOOKS], const char *_str)
 	}
 
 	return 0;
+}
+
+static int parse_pids(size_t size, __u32 arr[size], const char *_str,
+		      const char *name)
+{
+	char *pidstr, *str;
+	char *tokp = NULL;
+	int err, i = 0;
+	long long val;
+
+	str = malloc(strlen(_str) + 1);
+	if (!str)
+		return -ENOMEM;
+	strcpy(str, _str);
+
+	pidstr = strtok_r(str, ",", &tokp);
+	while (pidstr && i < size) {
+		err = parse_bounded_long(&val, pidstr, 1, PID_MAX_LIMIT, name);
+		if (err)
+			goto exit;
+		arr[i] = val;
+
+		pidstr = strtok_r(NULL, ",", &tokp);
+		i++;
+	}
+
+	if (pidstr)
+		// parsed maximum number of pids but more still remain
+		err = -E2BIG;
+
+exit:
+	free(str);
+	return err ?: i;
 }
 
 int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
@@ -420,6 +486,15 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 			break;
 		case 'n': // standing-queue-noempty
 			conf->bpf_conf.persist_through_empty = true;
+			break;
+		case 'p': // filter-pids
+			err = parse_pids(ARRAY_SIZE(conf->bpf_conf.pids),
+					 conf->bpf_conf.pids, optarg,
+					 optval_to_longopt(opt)->name);
+			if (err < 0)
+				return err;
+
+			conf->bpf_conf.npids = err;
 			break;
 		case 'h': // help
 			print_usage(stdout, argv[0]);
@@ -878,6 +953,27 @@ static int poll_events(int epoll_fd, const struct netstacklat_config *conf,
 	return err;
 }
 
+static void init_pidfilter_maps(const struct netstacklat_bpf *obj,
+				const struct netstacklat_config *conf)
+{
+	__u8 pid_ok_val = 1;
+	int map_fd;
+	__u32 i;
+
+	// The hashmap
+	map_fd = bpf_map__fd(obj->maps.netstack_pidfilter_hash);
+	for (i = 0; i < conf->bpf_conf.npids; i++) {
+		bpf_map_update_elem(map_fd, &conf->bpf_conf.pids[i],
+				    &pid_ok_val, BPF_NOEXIST);
+	}
+
+	map_fd = bpf_map__fd(obj->maps.netstack_pidfilter_arr);
+	for (i = 0; i < conf->bpf_conf.npids; i++) {
+		bpf_map_update_elem(map_fd, &conf->bpf_conf.pids[i],
+				    &pid_ok_val, 0);
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	int sig_fd, timer_fd, epoll_fd, sock_fd, err;
@@ -886,6 +982,7 @@ int main(int argc, char *argv[])
 			.interval = 10 * NS_PER_MS,
 			.target = 1 * NS_PER_MS,
 			.persist_through_empty = false,
+			.npids = 0,
 		},
 		.report_interval_s = 5,
 	};
@@ -927,6 +1024,8 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Failed loading eBPF programs: %s\n", errmsg);
 		goto exit_destroy_bpf;
 	}
+
+	init_pidfilter_maps(obj, &config);
 
 	err = netstacklat_bpf__attach(obj);
 	if (err) {

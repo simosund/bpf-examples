@@ -16,6 +16,7 @@ volatile const struct netstacklat_bpf_config user_config = {
 	.interval = 10 * NS_PER_MS,
 	.target = 1 * NS_PER_MS,
 	.persist_through_empty = false,
+	.npids = 0,
 };
 
 /* Helpers in maps.bpf.h require any histogram key to be a struct with a bucket member */
@@ -92,14 +93,36 @@ struct {
 } netstack_sock_standingqueue_seconds SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBINS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_pidmatch SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
 	__type(value, struct standing_queue_state);
 } netstack_sock_state SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_FILTER_PIDS);
+	__type(key, u32);
+	__type(value, u8);
+} netstack_pidfilter_hash SEC(".maps");
 
-static u32 get_exp2_histogram_bin_idx(u64 value, u32 max_bin)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, PID_MAX_LIMIT);
+	__type(key, u32);
+	__type(value, u8);
+} netstack_pidfilter_arr SEC(".maps");
+
+
+static u32
+get_exp2_histogram_bin_idx(u64 value, u32 max_bin)
 {
 	u32 bin = log2l(value);
 
@@ -155,6 +178,8 @@ static void *hook_to_histmap(enum netstacklat_hook hook)
 		return &netstack_latency_udp_sock_read_seconds;
 	case NETSTACKLAT_HOOK_SOCK_STANDINGQUEUE:
 		return &netstack_sock_standingqueue_seconds;
+	case NETSTACKLAT_HOOK_PIDMATCH:
+		return &netstack_pidmatch;
 	default:
 		return NULL;
 	}
@@ -258,10 +283,84 @@ static ktime_t standing_socket_queue_duration(struct sock *sk, ktime_t latency)
 	return duration;
 }
 
+static bool single_pidmatch(u32 val)
+{
+	return val == user_config.pids[0];
+}
+
+static bool bsearch_pidmatch(u32 val)
+{
+	u32 mid, low = 0, high = user_config.npids - 1;
+
+	while (low < high) {
+		mid = (low + high) / 2;
+		if (user_config.pids[mid] == val)
+			return true;
+
+		if (user_config.pids[mid] < val)
+			low = mid + 1;
+		else
+			high = mid; // cannot do mid - 1, as that might underflow
+	}
+
+	return false;
+}
+
+static bool hash_pidmatch(u32 val)
+{
+	return bpf_map_lookup_elem(&netstack_pidfilter_hash, &val) != NULL;
+}
+
+static bool arr_pidmatch(u32 val)
+{
+	u8 *pid_ok;
+
+	pid_ok = bpf_map_lookup_elem(&netstack_pidfilter_arr, &val);
+	if (!pid_ok)
+		return false;
+
+	return *pid_ok > 0;
+}
+
+static bool match_pid(int pid)
+{
+	u64 start, duration;
+	bool res;
+
+	if (user_config.npids == 0)
+		// No PID filter - all PIDs ok
+		return true;
+
+	start = bpf_ktime_get_ns();
+	//res = single_pidmatch(pid);
+	//res = bsearch_pidmatch(pid);
+	res = arr_pidmatch(pid);
+	//res = hash_pidmatch(pid);
+	duration = bpf_ktime_get_ns() - start;
+
+	record_latency(duration, NETSTACKLAT_HOOK_PIDMATCH);
+	return res;
+}
+
+static bool match_current_task(void)
+{
+	__u32 tgid;
+
+	if (user_config.npids == 0)
+		return true;
+
+	tgid = bpf_get_current_pid_tgid() >> 32;
+	return match_pid(tgid);
+}
+
 static void record_socket_read_latency(struct sock *sk, ktime_t tstamp,
 				       enum netstacklat_hook hook)
 {
 	ktime_t latency, duration;
+
+	if (!match_current_task())
+		return;
+
 	latency = time_since(tstamp);
 	if (latency < 0)
 		return;
