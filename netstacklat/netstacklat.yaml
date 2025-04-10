@@ -77,3 +77,26 @@ metrics:
           size: 4
           decoders:
             - name: uint
+    - name: netstack_tcp_standingqueue_seconds
+      help: Time that TCP socket reads have exceeded target latency
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 34
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+    - name: netstack_udp_standingqueue_seconds
+      help: Time that UDP socket reads have exceeded target latency
+      bucket_type: exp2
+      bucket_min: 0
+      bucket_max: 34
+      bucket_multiplier: 0.000000001 # nanoseconds to seconds
+      labels:
+        - name: bucket
+          size: 4
+          decoders:
+            - name: uint
+
