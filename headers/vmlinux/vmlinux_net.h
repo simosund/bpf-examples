@@ -150,4 +150,26 @@ struct scm_timestamping_internal {
         struct timespec64 ts[3];
 };
 
+struct sk_buff_list {
+	struct sk_buff *next;
+	struct sk_buff *prev;
+};
+
+struct sk_buff_head {
+	union {
+		struct {
+			struct sk_buff *next;
+			struct sk_buff *prev;
+		};
+		struct sk_buff_list list;
+	};
+	__u32 qlen;
+	/* spinlock_t lock; */
+};
+
+struct sock {
+	struct sk_buff_head sk_error_queue;
+	struct sk_buff_head sk_receive_queue;
+};
+
 #endif /* __VMLINUX_NET_H__ */

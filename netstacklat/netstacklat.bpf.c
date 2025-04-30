@@ -14,6 +14,11 @@ char LICENSE[] SEC("license") = "GPL";
 
 volatile const __s64 TAI_OFFSET = (37LL * NS_PER_S);
 volatile const struct netstacklat_bpf_config user_config = {
+	.sq = {
+		.interval = 10 * NS_PER_MS,
+		.target = 1 * NS_PER_MS,
+		.persist_through_empty = false,
+	},
 	.filter_pid = false,
 };
 
@@ -36,6 +41,11 @@ struct sk_buff___old {
  */
 struct hist_key {
 	u32 bucket;
+};
+
+struct standing_queue_state {
+	ktime_t first_above;
+	ktime_t last_above;
 };
 
 struct {
@@ -88,11 +98,32 @@ struct {
 } netstack_latency_udp_sock_read_seconds SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBUCKETS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_tcp_standingqueue_seconds SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HIST_NBUCKETS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_udp_standingqueue_seconds SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, PID_MAX_LIMIT);
 	__type(key, u32);
 	__type(value, u8);
 } netstack_pidfilter SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct standing_queue_state);
+} netstack_sock_state SEC(".maps");
 
 static u32 get_exp2_histogram_bucket_idx(u64 value, u32 max_bucket)
 {
@@ -156,6 +187,10 @@ static void *hook_to_histmap(enum netstacklat_hook hook)
 		return &netstack_latency_tcp_sock_read_seconds;
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
 		return &netstack_latency_udp_sock_read_seconds;
+	case NETSTACKLAT_HOOK_TCP_STANDINGQUEUE:
+		return &netstack_tcp_standingqueue_seconds;
+	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
+		return &netstack_udp_standingqueue_seconds;
 	default:
 		return NULL;
 	}
@@ -243,13 +278,90 @@ static bool filter_current_task(void)
 	return filter_pid(tgid);
 }
 
-static void record_socket_latency(struct sock *sk, ktime_t tstamp,
-				  enum netstacklat_hook hook)
+/*
+ * Is there no more data to read from the socket?
+ * For TCP socket it would be preferable to get the number of remaing bytes
+ * from tcp_inq_hint(), but this doesn't seem to be called unless specifically
+ * requsted by the application (and won't be accessible from existing hooks).
+ *
+ * As a more generic solution, just check if the socket receive queue is
+ * empty (no more skbs). Not sure if this is entierly accurate as UDP/TCP
+ * sockets seem to use some other receive queues of their own as well, but
+ * through some simple testing with bpftrace it seems to give reasonable
+ * results with iperf for both TCP and UDP.
+ */
+static bool sock_rxqueue_empty(struct sock *sk)
 {
+	/*
+	 * Right now just checks if the qlen member is 0. However,
+	 * skb_queue_empty_lockless() checks if next points to itself, so that
+	 * might perhaps be a safer option when used in a lockless context.
+	 */
+	return sk->sk_receive_queue.qlen == 0;
+}
+
+/*
+ * Detect how long the latency at the socket layer has been above the latency
+ * target using an algorithm similar to CoDel.
+ */
+static ktime_t socket_standingqueue_duration(struct sock *sk, ktime_t latency)
+{
+	struct standing_queue_state *q_state;
+	ktime_t now, duration = 0;
+
+	q_state = bpf_sk_storage_get(&netstack_sock_state, sk, NULL,
+				     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!q_state)
+		return 0;
+
+	if (latency < user_config.sq.target ||
+	    (!user_config.sq.persist_through_empty && sock_rxqueue_empty(sk))) {
+		if (q_state->first_above) {
+			duration = q_state->last_above - q_state->first_above;
+		}
+
+		q_state->first_above = 0;
+	} else {
+		/*
+		 * Reusing the same "now" timestamp used to calculate the
+		 * latency would be slightly more efficent, but having a
+		 * monotonic clock is preferable.
+		 */
+		now = bpf_ktime_get_ns();
+
+		q_state->last_above = now;
+		if (!q_state->first_above)
+			q_state->first_above = now;
+	}
+
+	return duration;
+}
+
+static void detect_socket_standingqueue(struct sock *sk, ktime_t latency,
+					enum netstacklat_hook sq_hook)
+{
+	ktime_t duration;
+
+	duration = socket_standingqueue_duration(sk, latency);
+	if (duration >= user_config.sq.interval)
+		record_latency(duration, sq_hook);
+}
+
+static void record_socket_latency(struct sock *sk, ktime_t tstamp,
+				  enum netstacklat_hook hook,
+				  enum netstacklat_hook sq_hook)
+{
+	ktime_t latency;
+
 	if (!filter_current_task())
 		return;
 
-	record_latency_since(tstamp, hook);
+	latency = time_since(tstamp);
+	if (latency < 0)
+		return;
+
+	record_latency(latency, hook);
+	detect_socket_standingqueue(sk, latency, sq_hook);
 }
 
 SEC("fentry/ip_rcv_core")
@@ -325,7 +437,8 @@ int BPF_PROG(netstacklat_tcp_recv_timestamp, void *msg, struct sock *sk,
 {
 	struct timespec64 *ts = &tss->ts[0];
 	record_socket_latency(sk, (ktime_t)ts->tv_sec * NS_PER_S + ts->tv_nsec,
-			      NETSTACKLAT_HOOK_TCP_SOCK_READ);
+			      NETSTACKLAT_HOOK_TCP_SOCK_READ,
+			      NETSTACKLAT_HOOK_TCP_STANDINGQUEUE);
 	return 0;
 }
 
@@ -333,6 +446,7 @@ SEC("fentry/skb_consume_udp")
 int BPF_PROG(netstacklat_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	     int len)
 {
-	record_socket_latency(sk, skb->tstamp, NETSTACKLAT_HOOK_UDP_SOCK_READ);
+	record_socket_latency(sk, skb->tstamp, NETSTACKLAT_HOOK_UDP_SOCK_READ,
+			      NETSTACKLAT_HOOK_UDP_STANDINGQUEUE);
 	return 0;
 }

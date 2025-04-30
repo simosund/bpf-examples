@@ -12,6 +12,7 @@
 #define HIST_NBUCKETS (HIST_MAX_LATENCY_SLOT + 2)
 
 #define NS_PER_S 1000000000
+#define NS_PER_MS 1000000
 
 // The highest possible PID on a Linux system (from /include/linux/threads.h)
 #define PID_MAX_LIMIT (4 * 1024 * 1024)
@@ -38,11 +39,18 @@ enum netstacklat_hook {
 	NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED,
 	NETSTACKLAT_HOOK_TCP_SOCK_READ,
 	NETSTACKLAT_HOOK_UDP_SOCK_READ,
+	NETSTACKLAT_HOOK_TCP_STANDINGQUEUE,
+	NETSTACKLAT_HOOK_UDP_STANDINGQUEUE,
 	NETSTACKLAT_N_HOOKS,
 };
 
-struct netstacklat_bpf_config
-{
+struct netstacklat_bpf_config {
+	// standing queue detection parameters
+	struct {
+		__u64 interval;
+		__u64 target;
+		bool persist_through_empty;
+	} sq;
 	bool filter_pid;
 };
 

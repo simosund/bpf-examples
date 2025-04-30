@@ -49,6 +49,8 @@ static const char *__doc__ =
 // Maximum number of different pids that can be filtered for
 #define MAX_FILTER_PIDS 4096
 
+#define ARG_STANDING_QUEUE_NOEMPTY 256
+
 struct hook_prog_collection {
 	struct bpf_program *progs[MAX_HOOK_PROGS];
 	int nprogs;
@@ -63,12 +65,15 @@ struct netstacklat_config {
 };
 
 static const struct option long_options[] = {
-	{ "help",            no_argument,       NULL, 'h' },
-	{ "report-interval", required_argument, NULL, 'r' },
-	{ "list-probes",     no_argument,       NULL, 'l' },
-	{ "enable-probe",    required_argument, NULL, 'e' },
-	{ "disable-probe",   required_argument, NULL, 'd' },
-	{ "filter-pid",      required_argument, NULL, 'p' },
+	{ "help",                    no_argument,       NULL, 'h' },
+	{ "report-interval",         required_argument, NULL, 'r' },
+	{ "list-probes",             no_argument,       NULL, 'l' },
+	{ "enable-probe",            required_argument, NULL, 'e' },
+	{ "disable-probe",           required_argument, NULL, 'd' },
+	{ "filter-pid",              required_argument, NULL, 'p' },
+	{ "standing-queue-target",   required_argument, NULL, 't' },
+	{ "standing-queue-interval", required_argument, NULL, 'i' },
+	{ "standing-queue-noempty",  no_argument,       NULL, ARG_STANDING_QUEUE_NOEMPTY },
 	{ 0, 0, 0, 0 }
 };
 
@@ -150,6 +155,10 @@ static const char *hook_to_str(enum netstacklat_hook hook)
 		return "tcp-socket-read";
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
 		return "udp-socket-read";
+	case NETSTACKLAT_HOOK_TCP_STANDINGQUEUE:
+		return "tcp-standing-queue";
+	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
+		return "udp-standing-queue";
 	default:
 		return "invalid";
 	}
@@ -184,6 +193,10 @@ static const char *hook_to_description(enum netstacklat_hook hook)
 		return "packet payload has been read from TCP socket, i.e. delivered to user space";
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
 		return "packet payload has been read from UDP socket, i.e. delivered to user space";
+	case NETSTACKLAT_HOOK_TCP_STANDINGQUEUE:
+		return "duration the tcp-socket-read latency has exceeded the target";
+	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
+		return "duration the udp-socket-read latency has exceeded the target";
 	default:
 		return "not a valid hook";
 	}
@@ -213,6 +226,12 @@ static int hook_to_histmap(enum netstacklat_hook hook,
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
 		return bpf_map__fd(
 			obj->maps.netstack_latency_udp_sock_read_seconds);
+	case NETSTACKLAT_HOOK_TCP_STANDINGQUEUE:
+		return bpf_map__fd(
+			obj->maps.netstack_tcp_standingqueue_seconds);
+	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
+		return bpf_map__fd(
+			obj->maps.netstack_udp_standingqueue_seconds);
 	default:
 		return -EINVAL;
 	}
@@ -256,6 +275,12 @@ static void hook_to_progs(struct hook_prog_collection *progs,
 		progs->progs[0] = obj->progs.netstacklat_skb_consume_udp;
 		progs->nprogs = 1;
 		break;
+	case NETSTACKLAT_HOOK_TCP_STANDINGQUEUE:
+		// Has no programs on its own, depends on tcp-sock-read
+		progs->nprogs = 0;
+	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
+		// Has no programs on its own, depends on udp-sock-read
+		progs->nprogs = 0;
 	default:
 		progs->nprogs = 0;
 		break;
@@ -454,6 +479,26 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 
 			conf->npids += err;
 			conf->bpf_conf.filter_pid = true;
+		case 't': // standing-queue-target
+			err = parse_bounded_double(
+				&fval, optarg, 0.001, 10000,
+				optval_to_longopt(opt)->name);
+			if (err)
+				return err;
+
+			conf->bpf_conf.sq.target = fval * NS_PER_MS;
+			break;
+		case 'i': // standing-queue-interval
+			err = parse_bounded_double(
+				&fval, optarg, 0.001, 10000,
+				optval_to_longopt(opt)->name);
+			if (err)
+				return err;
+
+			conf->bpf_conf.sq.interval = fval * NS_PER_MS;
+			break;
+		case ARG_STANDING_QUEUE_NOEMPTY:
+			conf->bpf_conf.sq.persist_through_empty = true;
 			break;
 		case 'h': // help
 			print_usage(stdout, argv[0]);
@@ -937,6 +982,13 @@ int main(int argc, char *argv[])
 {
 	int sig_fd, timer_fd, epoll_fd, sock_fd, err;
 	struct netstacklat_config config = {
+		.bpf_conf = {
+			.sq = {
+				.interval = 10 * NS_PER_MS,
+				.target = 1 * NS_PER_MS,
+				.persist_through_empty = false,
+			},
+		},
 		.report_interval_s = 5,
 	};
 	struct netstacklat_bpf *obj;
