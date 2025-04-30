@@ -44,6 +44,8 @@ static const char *__doc__ =
 #define MAX_BUCKETCOUNT_STRLEN 10
 #define MAX_BAR_STRLEN (80 - 6 - MAX_BUCKETSPAN_STRLEN - MAX_BUCKETCOUNT_STRLEN)
 
+#define LOOKUP_BATCH_SIZE 128
+
 #define MAX_HOOK_PROGS 4
 
 // Maximum number of different pids that can be filtered for
@@ -54,6 +56,11 @@ static const char *__doc__ =
 struct hook_prog_collection {
 	struct bpf_program *progs[MAX_HOOK_PROGS];
 	int nprogs;
+};
+
+struct histogram_entry {
+	struct hist_key key; // must be first entry (so it can be casted to hist_key)
+	__u64 *buckets;
 };
 
 struct netstacklat_config {
@@ -199,41 +206,6 @@ static const char *hook_to_description(enum netstacklat_hook hook)
 		return "duration the udp-socket-read latency has exceeded the target";
 	default:
 		return "not a valid hook";
-	}
-}
-
-static int hook_to_histmap(enum netstacklat_hook hook,
-			   const struct netstacklat_bpf *obj)
-{
-	switch (hook) {
-	case NETSTACKLAT_HOOK_IP_RCV:
-		return bpf_map__fd(obj->maps.netstack_latency_ip_start_seconds);
-	case NETSTACKLAT_HOOK_TCP_START:
-		return bpf_map__fd(
-			obj->maps.netstack_latency_tcp_start_seconds);
-	case NETSTACKLAT_HOOK_UDP_START:
-		return bpf_map__fd(
-			obj->maps.netstack_latency_udp_start_seconds);
-	case NETSTACKLAT_HOOK_TCP_SOCK_ENQUEUED:
-		return bpf_map__fd(
-			obj->maps.netstack_latency_tcp_sock_enqueued_seconds);
-	case NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED:
-		return bpf_map__fd(
-			obj->maps.netstack_latency_udp_sock_enqueued_seconds);
-	case NETSTACKLAT_HOOK_TCP_SOCK_READ:
-		return bpf_map__fd(
-			obj->maps.netstack_latency_tcp_sock_read_seconds);
-	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
-		return bpf_map__fd(
-			obj->maps.netstack_latency_udp_sock_read_seconds);
-	case NETSTACKLAT_HOOK_TCP_STANDINGQUEUE:
-		return bpf_map__fd(
-			obj->maps.netstack_tcp_standingqueue_seconds);
-	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
-		return bpf_map__fd(
-			obj->maps.netstack_udp_standingqueue_seconds);
-	default:
-		return -EINVAL;
 	}
 }
 
@@ -657,93 +629,186 @@ static void print_log2hist(FILE *stream, size_t n, const __u64 hist[n],
 	}
 }
 
-static void merge_percpu_hist(size_t n, int ncpus,
-			      const __u64 percpu_hist[n][ncpus],
-			      __u64 merged_hist[n])
+static void print_histkey(FILE *stream, const struct hist_key *key)
 {
-	int idx, cpu;
+	fprintf(stream, "%s", hook_to_str(key->hook));
+}
 
-	memset(merged_hist, 0, sizeof(__u64) * n);
+static int cmp_histkey(const void *val1, const void *val2)
+{
+	struct hist_key *key1 = (struct hist_key *)val1;
+	struct hist_key *key2 = (struct hist_key *)val2;
 
-	for (idx = 0; idx < n; idx++) {
-		for (cpu = 0; cpu < ncpus; cpu++) {
-			merged_hist[idx] += percpu_hist[idx][cpu];
-		}
+	return (int)key1->hook - key2->hook;
+}
+
+static int insert_last_hist_sorted(size_t nhists,
+				   struct histogram_entry hists[nhists])
+{
+	struct histogram_entry tmp;
+	int i;
+
+	if (nhists < 2)
+		return 0;
+
+	i = nhists - 1;
+	while (i > 0 && cmp_histkey(&hists[nhists - 1], &hists[i - 1]) < 0)
+		i--;
+
+	if (i == nhists - 1)
+		// Last hist already in the right place, no need to swap it in
+		return i;
+
+	// Swap in hist to the correct position
+	memcpy(&tmp, &hists[nhists - 1], sizeof(tmp));
+	memmove(&hists[i + 1], &hists[i], (nhists - 1 - i) * sizeof(*hists));
+	memcpy(&hists[i], &tmp, sizeof(*hists));
+
+	return i;
+}
+
+static struct histogram_entry *
+lookup_or_zeroinit_hist(const struct hist_key *key, size_t *nhists,
+			size_t max_hists,
+			struct histogram_entry hists[max_hists])
+{
+	struct histogram_entry *hist;
+	__u64 *buckets;
+	int i;
+
+	hist = bsearch(key, hists, *nhists, sizeof(*hists), cmp_histkey);
+	if (hist)
+		return hist;
+
+	// No matching histogram key found - create new histogram entry and insert it
+	if (*nhists >= max_hists) {
+		errno = ENOSPC;
+		return NULL;
+	}
+
+	buckets = calloc(HIST_NBUCKETS, sizeof(*buckets));
+	if (!buckets) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	hist = &hists[(*nhists)++];
+	memcpy(&hist->key, key, sizeof(hist->key));
+	hist->key.bucket = 0;
+	hist->buckets = buckets;
+
+	i = insert_last_hist_sorted(*nhists, hists);
+	return &hists[i];
+}
+
+static int update_histogram_entry(const struct hist_key *key, __u64 count,
+				  size_t *nhists, size_t max_hists,
+				  struct histogram_entry hists[max_hists])
+{
+	struct histogram_entry *hist;
+	int bucket = key->bucket;
+
+	hist = lookup_or_zeroinit_hist(key, nhists, max_hists, hists);
+	if (!hist)
+		return -errno;
+
+	hist->buckets[bucket] += count;
+	return 0;
+}
+
+static void clear_histograms(size_t nhists,
+			     struct histogram_entry hists[nhists])
+{
+	int i;
+
+	for (i = 0; i < nhists; i++) {
+		memset(hists[i].buckets, 0,
+		       HIST_NBUCKETS * sizeof(*hists[i].buckets));
 	}
 }
 
-static int fetch_hist_map(int map_fd, __u64 hist[HIST_NBUCKETS])
+static __u64 sum_percpu_vals(int cpus, __u64 vals[cpus])
 {
-	__u32 in_batch, out_batch, count = HIST_NBUCKETS;
+	__u64 sum = 0;
+	int i;
+
+	for (i = 0; i < cpus; i++)
+		sum += vals[i];
+
+	return sum;
+}
+
+static int fetch_histograms(int map_fd, size_t *nhists, size_t max_hists,
+			    struct histogram_entry hists[max_hists])
+{
+	__u32 in_batch, out_batch, count = LOOKUP_BATCH_SIZE;
 	int ncpus = libbpf_num_possible_cpus();
-	__u32 idx, buckets_fetched = 0;
-	__u64 (*percpu_hist)[ncpus];
-	__u32 *keys;
-	int err = 0;
+	__u64 (*percpu_buckets)[ncpus];
+	bool entries_remain = true;
+	int i, nentries = 0, err;
+	struct hist_key *keys;
 
-	DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, batch_opts, .flags = BPF_EXIST);
+	DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, batch_opts);
 
-	percpu_hist = calloc(HIST_NBUCKETS, sizeof(*percpu_hist));
-	keys = calloc(HIST_NBUCKETS, sizeof(*keys));
-	if (!percpu_hist || !keys) {
+	percpu_buckets = calloc(LOOKUP_BATCH_SIZE, sizeof(*percpu_buckets));
+	keys = calloc(LOOKUP_BATCH_SIZE, sizeof(*keys));
+	if (!percpu_buckets || !keys) {
 		err = -ENOMEM;
 		goto exit;
 	}
 
-	while (buckets_fetched < HIST_NBUCKETS) {
+	while (entries_remain) {
 		err = bpf_map_lookup_batch(map_fd,
-					   buckets_fetched > 0 ? &in_batch : NULL,
-					   &out_batch, keys + buckets_fetched,
-					   percpu_hist + buckets_fetched, &count,
-					   &batch_opts);
-		if (err == -ENOENT) // All entries fetched
+					   nentries > 0 ? &in_batch : NULL,
+					   &out_batch, keys, percpu_buckets,
+					   &count, &batch_opts);
+		if (err == -ENOENT) { // All entries fetched
+			entries_remain = false;
 			err = 0;
-		else if (err)
+		} else if (err) {
 			goto exit;
-
-		// Verify keys match expected idx range
-		for (idx = buckets_fetched; idx < buckets_fetched + count; idx++) {
-			if (keys[idx] != idx) {
-				err = -EBADSLT;
-				goto exit;
-			}
 		}
 
+		for (i = 0; i < count; i++) {
+			err = update_histogram_entry(
+				&keys[i],
+				sum_percpu_vals(ncpus, percpu_buckets[i]),
+				nhists, max_hists, hists);
+			if (err)
+				goto exit;
+		}
+
+		nentries += count;
+		count = LOOKUP_BATCH_SIZE;
 		in_batch = out_batch;
-		buckets_fetched += count;
-		count = HIST_NBUCKETS - buckets_fetched;
 	}
 
-	merge_percpu_hist(HIST_NBUCKETS, ncpus, percpu_hist, hist);
-
 exit:
-	free(percpu_hist);
+	free(percpu_buckets);
 	free(keys);
-	return err;
+	return err ?: nentries;
 }
 
-static int report_stats(const struct netstacklat_config *conf,
-			const struct netstacklat_bpf *obj)
+static int report_stats(const struct netstacklat_bpf *obj)
 {
-	enum netstacklat_hook hook;
-	__u64 hist[HIST_NBUCKETS] = { 0 };
+	static struct histogram_entry hists[NETSTACKLAT_N_HOOKS] = { 0 };
+	static size_t nhists = 0;
+	int i, err;
 	time_t t;
-	int err;
+
+	clear_histograms(nhists, hists);
+	err = fetch_histograms(bpf_map__fd(obj->maps.netstack_latency_seconds),
+			       &nhists, ARRAY_SIZE(hists), hists);
+	if (err < 0)
+		return err;
 
 	time(&t);
 	printf("%s", ctime(&t));
 
-	for (hook = 1; hook < NETSTACKLAT_N_HOOKS; hook++) {
-		if (!conf->enabled_hooks[hook])
-			continue;
-
-		printf("%s:\n", hook_to_str(hook));
-
-		err = fetch_hist_map(hook_to_histmap(hook, obj), hist);
-		if (err)
-			return err;
-
-		print_log2hist(stdout, ARRAY_SIZE(hist), hist, 1);
+	for (i = 0; i < nhists; i++) {
+		print_histkey(stdout, &hists[i].key);
+		printf(":\n");
+		print_log2hist(stdout, HIST_NBUCKETS, hists[i].buckets, 1);
 		printf("\n");
 	}
 	fflush(stdout);
@@ -872,8 +937,7 @@ static int setup_timer(__u64 interval_ns)
 	return fd;
 }
 
-static int handle_timer(int timer_fd, const struct netstacklat_config *conf,
-			const struct netstacklat_bpf *obj)
+static int handle_timer(int timer_fd, const struct netstacklat_bpf *obj)
 {
 	__u64 timer_exps;
 	ssize_t size;
@@ -890,7 +954,7 @@ static int handle_timer(int timer_fd, const struct netstacklat_config *conf,
 		fprintf(stderr, "Warning: Missed %llu reporting intervals\n",
 			timer_exps - 1);
 
-	return report_stats(conf, obj);
+	return report_stats(obj);
 }
 
 static int epoll_add_event(int epoll_fd, int fd, __u64 event_type, __u64 value)
@@ -930,8 +994,7 @@ err:
 	return err;
 }
 
-static int poll_events(int epoll_fd, const struct netstacklat_config *conf,
-		       const struct netstacklat_bpf *obj)
+static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj)
 {
 	struct epoll_event events[MAX_EPOLL_EVENTS];
 	int i, n, fd, err = 0;
@@ -950,7 +1013,7 @@ static int poll_events(int epoll_fd, const struct netstacklat_config *conf,
 			err = handle_signal(fd);
 			break;
 		case NETSTACKLAT_EPOLL_TIMER:
-			err = handle_timer(fd, conf, obj);
+			err = handle_timer(fd, obj);
 			break;
 		default:
 			fprintf(stderr, "Warning: unexpected epoll data: %lu\n",
@@ -1075,12 +1138,12 @@ int main(int argc, char *argv[])
 
 	// Report stats until user shuts down program
 	while (true) {
-		err = poll_events(epoll_fd, &config, obj);
+		err = poll_events(epoll_fd, obj);
 
 		if (err) {
 			if (err == NETSTACKLAT_ABORT) {
 				// Report stats a final time before terminating
-				err = report_stats(&config, obj);
+				err = report_stats(obj);
 			} else {
 				libbpf_strerror(err, errmsg, sizeof(errmsg));
 				fprintf(stderr, "Failed polling fds: %s\n",
