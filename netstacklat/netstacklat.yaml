@@ -7,6 +7,10 @@ metrics:
       bucket_max: 34
       bucket_multiplier: 0.000000001 # nanoseconds to seconds
       labels:
+        - name: comm
+          size: 16
+          decoders:
+            - name: string
         - name: hook
           size: 2
           decoders:
