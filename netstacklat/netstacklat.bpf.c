@@ -37,81 +37,17 @@ struct sk_buff___old {
 	__u8 mono_delivery_time: 1;
 } __attribute__((preserve_access_index));
 
-/*
- * To be compatible with ebpf-exporter, all histograms need a key whose final
- * member is the histogram bucket index
- */
-struct hist_key {
-	u32 bucket;
-};
-
 struct standing_queue_state {
 	ktime_t first_above;
 	ktime_t last_above;
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(max_entries, HIST_NBUCKETS * NETSTACKLAT_N_HOOKS);
+	__type(key, struct hist_key);
 	__type(value, u64);
-} netstack_latency_ip_start_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_latency_tcp_start_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_latency_udp_start_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_latency_tcp_sock_enqueued_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_latency_udp_sock_enqueued_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_latency_tcp_sock_read_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_latency_udp_sock_read_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_tcp_standingqueue_seconds SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, HIST_NBUCKETS);
-	__type(key, u32);
-	__type(value, u64);
-} netstack_udp_standingqueue_seconds SEC(".maps");
+} netstack_latency_seconds SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -126,6 +62,20 @@ struct {
 	__type(key, int);
 	__type(value, struct standing_queue_state);
 } netstack_sock_state SEC(".maps");
+
+static u64 *lookup_or_zeroinit_histentry(void *map, const struct hist_key *key)
+{
+	u64 zero = 0;
+	u64 *val;
+
+	val = bpf_map_lookup_elem(map, key);
+	if (val)
+		return val;
+
+	// Key not in map - try insert it and lookup again
+	bpf_map_update_elem(map, key, &zero, BPF_NOEXIST);
+	return bpf_map_lookup_elem(map, key);
+}
 
 static u32 get_exp2_histogram_bucket_idx(u64 value, u32 max_bucket)
 {
@@ -158,7 +108,7 @@ static void increment_exp2_histogram_nosync(void *map, struct hist_key key,
 
 	// Increment histogram
 	key.bucket = get_exp2_histogram_bucket_idx(value, max_bucket);
-	bucket_count = bpf_map_lookup_elem(map, &key);
+	bucket_count = lookup_or_zeroinit_histentry(map, &key);
 	if (bucket_count)
 		(*bucket_count)++;
 
@@ -167,35 +117,9 @@ static void increment_exp2_histogram_nosync(void *map, struct hist_key key,
 		return;
 
 	key.bucket = max_bucket + 1;
-	bucket_count = bpf_map_lookup_elem(map, &key);
+	bucket_count = lookup_or_zeroinit_histentry(map, &key);
 	if (bucket_count)
 		*bucket_count += value;
-}
-
-static void *hook_to_histmap(enum netstacklat_hook hook)
-{
-	switch (hook) {
-	case NETSTACKLAT_HOOK_IP_RCV:
-		return &netstack_latency_ip_start_seconds;
-	case NETSTACKLAT_HOOK_TCP_START:
-		return &netstack_latency_tcp_start_seconds;
-	case NETSTACKLAT_HOOK_UDP_START:
-		return &netstack_latency_udp_start_seconds;
-	case NETSTACKLAT_HOOK_TCP_SOCK_ENQUEUED:
-		return &netstack_latency_tcp_sock_enqueued_seconds;
-	case NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED:
-		return &netstack_latency_udp_sock_enqueued_seconds;
-	case NETSTACKLAT_HOOK_TCP_SOCK_READ:
-		return &netstack_latency_tcp_sock_read_seconds;
-	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
-		return &netstack_latency_udp_sock_read_seconds;
-	case NETSTACKLAT_HOOK_TCP_STANDINGQUEUE:
-		return &netstack_tcp_standingqueue_seconds;
-	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
-		return &netstack_udp_standingqueue_seconds;
-	default:
-		return NULL;
-	}
 }
 
 static ktime_t time_since(ktime_t tstamp)
@@ -214,8 +138,8 @@ static ktime_t time_since(ktime_t tstamp)
 
 static void record_latency(ktime_t latency, enum netstacklat_hook hook)
 {
-	struct hist_key key = { 0 };
-	increment_exp2_histogram_nosync(hook_to_histmap(hook), key, latency,
+	struct hist_key key = { .hook = hook };
+	increment_exp2_histogram_nosync(&netstack_latency_seconds, key, latency,
 					HIST_MAX_LATENCY_SLOT);
 }
 
