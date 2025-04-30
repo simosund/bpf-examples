@@ -19,6 +19,8 @@ volatile const struct netstacklat_bpf_config user_config = {
 		.target = 1 * NS_PER_MS,
 		.persist_through_empty = false,
 	},
+	.track_tcp_sq = true,
+	.track_udp_sq = true,
 	.filter_pid = false,
 };
 
@@ -348,7 +350,7 @@ static void detect_socket_standingqueue(struct sock *sk, ktime_t latency,
 }
 
 static void record_socket_latency(struct sock *sk, ktime_t tstamp,
-				  enum netstacklat_hook hook,
+				  enum netstacklat_hook hook, bool track_sq,
 				  enum netstacklat_hook sq_hook)
 {
 	ktime_t latency;
@@ -361,7 +363,9 @@ static void record_socket_latency(struct sock *sk, ktime_t tstamp,
 		return;
 
 	record_latency(latency, hook);
-	detect_socket_standingqueue(sk, latency, sq_hook);
+
+	if (track_sq)
+		detect_socket_standingqueue(sk, latency, sq_hook);
 }
 
 SEC("fentry/ip_rcv_core")
@@ -438,6 +442,7 @@ int BPF_PROG(netstacklat_tcp_recv_timestamp, void *msg, struct sock *sk,
 	struct timespec64 *ts = &tss->ts[0];
 	record_socket_latency(sk, (ktime_t)ts->tv_sec * NS_PER_S + ts->tv_nsec,
 			      NETSTACKLAT_HOOK_TCP_SOCK_READ,
+			      user_config.track_tcp_sq,
 			      NETSTACKLAT_HOOK_TCP_STANDINGQUEUE);
 	return 0;
 }
@@ -447,6 +452,7 @@ int BPF_PROG(netstacklat_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	     int len)
 {
 	record_socket_latency(sk, skb->tstamp, NETSTACKLAT_HOOK_UDP_SOCK_READ,
+			      user_config.track_udp_sq,
 			      NETSTACKLAT_HOOK_UDP_STANDINGQUEUE);
 	return 0;
 }

@@ -51,6 +51,8 @@ struct netstacklat_bpf_config {
 		__u64 target;
 		bool persist_through_empty;
 	} sq;
+	bool track_tcp_sq;
+	bool track_udp_sq;
 	bool filter_pid;
 };
 

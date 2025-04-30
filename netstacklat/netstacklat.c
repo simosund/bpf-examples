@@ -518,6 +518,11 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 		return -EINVAL;
 	}
 
+	conf->bpf_conf.track_tcp_sq =
+		conf->enabled_hooks[NETSTACKLAT_HOOK_TCP_STANDINGQUEUE];
+	conf->bpf_conf.track_udp_sq =
+		conf->enabled_hooks[NETSTACKLAT_HOOK_UDP_STANDINGQUEUE];
+
 	return 0;
 }
 
