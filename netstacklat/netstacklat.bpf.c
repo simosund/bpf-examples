@@ -22,6 +22,7 @@ volatile const struct netstacklat_bpf_config user_config = {
 	.track_tcp_sq = true,
 	.track_udp_sq = true,
 	.filter_pid = false,
+	.groupby_comm = false,
 };
 
 /*
@@ -44,7 +45,7 @@ struct standing_queue_state {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-	__uint(max_entries, HIST_NBUCKETS * NETSTACKLAT_N_HOOKS);
+	__uint(max_entries, HIST_NBUCKETS * NETSTACKLAT_N_HOOKS * 16);
 	__type(key, struct hist_key);
 	__type(value, u64);
 } netstack_latency_seconds SEC(".maps");
@@ -136,22 +137,24 @@ static ktime_t time_since(ktime_t tstamp)
 	return now - tstamp;
 }
 
-static void record_latency(ktime_t latency, enum netstacklat_hook hook)
+static void record_latency(ktime_t latency, struct hist_key *key)
 {
-	struct hist_key key = { .hook = hook };
-	increment_exp2_histogram_nosync(&netstack_latency_seconds, key, latency,
+	struct hist_key _key = *key;
+	increment_exp2_histogram_nosync(&netstack_latency_seconds, _key, latency,
 					HIST_MAX_LATENCY_SLOT);
 }
 
-static void record_latency_since(ktime_t tstamp, enum netstacklat_hook hook)
+static void record_latency_since(ktime_t tstamp, struct hist_key *key)
 {
 	ktime_t latency = time_since(tstamp);
 	if (latency >= 0)
-		record_latency(latency, hook);
+		record_latency(latency, key);
 }
 
 static void record_skb_latency(struct sk_buff *skb, enum netstacklat_hook hook)
 {
+	struct hist_key key = { .hook = hook };
+
 	if (bpf_core_field_exists(skb->tstamp_type)) {
 		/*
 		 * For kernels >= v6.11 the tstamp_type being non-zero
@@ -175,7 +178,7 @@ static void record_skb_latency(struct sk_buff *skb, enum netstacklat_hook hook)
 			return;
 	}
 
-	record_latency_since(skb->tstamp, hook);
+	record_latency_since(skb->tstamp, &key);
 }
 
 static bool filter_pid(u32 pid)
@@ -264,19 +267,20 @@ static ktime_t socket_standingqueue_duration(struct sock *sk, ktime_t latency)
 }
 
 static void detect_socket_standingqueue(struct sock *sk, ktime_t latency,
-					enum netstacklat_hook sq_hook)
+					struct hist_key *key)
 {
 	ktime_t duration;
 
 	duration = socket_standingqueue_duration(sk, latency);
 	if (duration >= user_config.sq.interval)
-		record_latency(duration, sq_hook);
+		record_latency(duration, key);
 }
 
 static void record_socket_latency(struct sock *sk, ktime_t tstamp,
 				  enum netstacklat_hook hook, bool track_sq,
 				  enum netstacklat_hook sq_hook)
 {
+	struct hist_key key = { .hook = hook };
 	ktime_t latency;
 
 	if (!filter_current_task())
@@ -286,10 +290,15 @@ static void record_socket_latency(struct sock *sk, ktime_t tstamp,
 	if (latency < 0)
 		return;
 
-	record_latency(latency, hook);
+	if (user_config.groupby_comm)
+		bpf_get_current_comm(&key.comm, sizeof(key.comm));
+	record_latency(latency, &key);
 
-	if (track_sq)
-		detect_socket_standingqueue(sk, latency, sq_hook);
+	if (track_sq) {
+		key.hook = sq_hook;
+		detect_socket_standingqueue(sk, latency, &key);
+	}
+
 }
 
 SEC("fentry/ip_rcv_core")
