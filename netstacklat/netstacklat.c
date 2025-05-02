@@ -167,6 +167,8 @@ static const char *hook_to_str(enum netstacklat_hook hook)
 		return "tcp-standing-queue";
 	case NETSTACKLAT_HOOK_UDP_STANDINGQUEUE:
 		return "udp-standing-queue";
+	case NETSTACKLAT_HOOK_SOCKLOCALSTORAGE:
+		return "sock-localstorage";
 	default:
 		return "invalid";
 	}

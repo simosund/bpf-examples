@@ -237,9 +237,15 @@ static ktime_t socket_standingqueue_duration(struct sock *sk, ktime_t latency)
 {
 	struct standing_queue_state *q_state;
 	ktime_t now, duration = 0;
+	ktime_t sock_lookup_time;
+	struct hist_key sock_key = { .hook = NETSTACKLAT_HOOK_SOCKLOCALSTORAGE };
 
+	sock_lookup_time = bpf_ktime_get_ns();
 	q_state = bpf_sk_storage_get(&netstack_sock_state, sk, NULL,
 				     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	sock_lookup_time = bpf_ktime_get_ns() - sock_lookup_time;
+	record_latency(sock_lookup_time, &sock_key);
+
 	if (!q_state)
 		return 0;
 

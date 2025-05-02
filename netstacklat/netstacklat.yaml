@@ -26,6 +26,7 @@ metrics:
                 7: "udp-socket-read"
                 8: "tcp-standing-queue"
                 9: "udp-standing-queue"
+                10: "sock-localstorage"
         - name: bucket
           size: 2
           decoders:
