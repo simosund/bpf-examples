@@ -16,7 +16,7 @@ volatile const __s64 TAI_OFFSET = (37LL * NS_PER_S);
 volatile const struct netstacklat_bpf_config user_config = {
 	.sq = {
 		.interval = 10 * NS_PER_MS,
-		.target = 1 * NS_PER_MS,
+		.target = 1000,
 		.persist_through_empty = false,
 	},
 	.track_tcp_sq = true,
@@ -144,14 +144,15 @@ static void record_latency(ktime_t latency, struct hist_key *key)
 					HIST_MAX_LATENCY_SLOT);
 }
 
-static void record_latency_since(ktime_t tstamp, struct hist_key *key)
+static ktime_t record_latency_since(ktime_t tstamp, struct hist_key *key)
 {
 	ktime_t latency = time_since(tstamp);
 	if (latency >= 0)
 		record_latency(latency, key);
+	return latency;
 }
 
-static void record_skb_latency(struct sk_buff *skb, enum netstacklat_hook hook)
+static ktime_t record_skb_latency(struct sk_buff *skb, enum netstacklat_hook hook)
 {
 	struct hist_key key = { .hook = hook };
 
@@ -163,7 +164,7 @@ static void record_skb_latency(struct sk_buff *skb, enum netstacklat_hook hook)
 		 * https://lore.kernel.org/all/20240509211834.3235191-2-quic_abchauha@quicinc.com/
 		 */
 		if (BPF_CORE_READ_BITFIELD(skb, tstamp_type) > 0)
-			return;
+			return -1;
 
 	} else {
 		/*
@@ -175,10 +176,10 @@ static void record_skb_latency(struct sk_buff *skb, enum netstacklat_hook hook)
 		 */
 		struct sk_buff___old *skb_old = (void *)skb;
 		if (BPF_CORE_READ_BITFIELD(skb_old, mono_delivery_time) > 0)
-			return;
+			return -1;
 	}
 
-	record_latency_since(skb->tstamp, &key);
+	return record_latency_since(skb->tstamp, &key);
 }
 
 static bool filter_pid(u32 pid)
@@ -300,10 +301,10 @@ static void record_socket_latency(struct sock *sk, ktime_t tstamp,
 		bpf_get_current_comm(&key.comm, sizeof(key.comm));
 	record_latency(latency, &key);
 
-	if (track_sq) {
-		key.hook = sq_hook;
-		detect_socket_standingqueue(sk, latency, &key);
-	}
+	/* if (track_sq) { */
+	/* 	key.hook = sq_hook; */
+	/* 	detect_socket_standingqueue(sk, latency, &key); */
+	/* } */
 
 }
 
@@ -354,7 +355,13 @@ int BPF_PROG(netstacklat_udpv6_rcv, struct sk_buff *skb)
 SEC("fexit/tcp_data_queue")
 int BPF_PROG(netstacklat_tcp_data_queue, struct sock *sk, struct sk_buff *skb)
 {
-	record_skb_latency(skb, NETSTACKLAT_HOOK_TCP_SOCK_ENQUEUED);
+	struct hist_key key = { .hook = NETSTACKLAT_HOOK_TCP_STANDINGQUEUE };
+	ktime_t latency;
+
+	latency = record_skb_latency(skb, NETSTACKLAT_HOOK_TCP_SOCK_ENQUEUED);
+	if (user_config.track_tcp_sq)
+		detect_socket_standingqueue(sk, latency, &key);
+
 	return 0;
 }
 
@@ -362,7 +369,13 @@ SEC("fexit/udp_queue_rcv_one_skb")
 int BPF_PROG(netstacklat_udp_queue_rcv_one_skb, struct sock *sk,
 	     struct sk_buff *skb)
 {
-	record_skb_latency(skb, NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED);
+	struct hist_key key = { .hook = NETSTACKLAT_HOOK_UDP_STANDINGQUEUE };
+	ktime_t latency;
+
+	latency = record_skb_latency(skb, NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED);
+	if (user_config.track_udp_sq)
+		detect_socket_standingqueue(sk, latency, &key);
+
 	return 0;
 }
 
@@ -370,7 +383,13 @@ SEC("fexit/udpv6_queue_rcv_one_skb")
 int BPF_PROG(netstacklat_udpv6_queue_rcv_one_skb, struct sock *sk,
 	     struct sk_buff *skb)
 {
-	record_skb_latency(skb, NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED);
+	struct hist_key key = { .hook = NETSTACKLAT_HOOK_UDP_STANDINGQUEUE };
+	ktime_t latency;
+
+	latency = record_skb_latency(skb, NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED);
+	if (user_config.track_udp_sq)
+		detect_socket_standingqueue(sk, latency, &key);
+
 	return 0;
 }
 
@@ -381,7 +400,7 @@ int BPF_PROG(netstacklat_tcp_recv_timestamp, void *msg, struct sock *sk,
 	struct timespec64 *ts = &tss->ts[0];
 	record_socket_latency(sk, (ktime_t)ts->tv_sec * NS_PER_S + ts->tv_nsec,
 			      NETSTACKLAT_HOOK_TCP_SOCK_READ,
-			      user_config.track_tcp_sq,
+			      false,
 			      NETSTACKLAT_HOOK_TCP_STANDINGQUEUE);
 	return 0;
 }
@@ -391,7 +410,7 @@ int BPF_PROG(netstacklat_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	     int len)
 {
 	record_socket_latency(sk, skb->tstamp, NETSTACKLAT_HOOK_UDP_SOCK_READ,
-			      user_config.track_udp_sq,
+			      false,
 			      NETSTACKLAT_HOOK_UDP_STANDINGQUEUE);
 	return 0;
 }
