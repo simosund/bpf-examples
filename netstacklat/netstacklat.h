@@ -41,8 +41,13 @@ enum netstacklat_hook {
 	NETSTACKLAT_N_HOOKS,
 };
 
-struct netstacklat_bpf_config
-{
+// Key used for the histogram map
+struct hist_key {
+	__u16 hook; // need known size for ebpf-exporter to decode
+	__u16 bucket; // needs to be last to be compatible with ebpf-exporter
+};
+
+struct netstacklat_bpf_config {
 	bool filter_pid;
 };
 
