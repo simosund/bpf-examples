@@ -76,6 +76,7 @@ static const struct option long_options[] = {
 	{ "enable-probe",    required_argument, NULL, 'e' },
 	{ "disable-probe",   required_argument, NULL, 'd' },
 	{ "filter-pid",      required_argument, NULL, 'p' },
+	{ "groupby",         required_argument, NULL, 'g' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -433,6 +434,10 @@ int parse_arguments(int argc, char *argv[], struct netstacklat_config *conf)
 			conf->npids += err;
 			conf->bpf_conf.filter_pid = true;
 			break;
+		case 'g': //groupby
+			// TODO - properly parse what to group by
+			conf->bpf_conf.groupby_comm = true;
+			break;
 		case 'h': // help
 			print_usage(stdout, argv[0]);
 			exit(EXIT_SUCCESS);
@@ -588,6 +593,8 @@ static void print_log2hist(FILE *stream, size_t n, const __u64 hist[n],
 static void print_histkey(FILE *stream, const struct hist_key *key)
 {
 	fprintf(stream, "%s", hook_to_str(key->hook));
+	if (strlen(key->comm) > 0)
+		fprintf(stream, ", %s", key->comm);
 }
 
 static int cmp_histkey(const void *val1, const void *val2)
@@ -595,7 +602,10 @@ static int cmp_histkey(const void *val1, const void *val2)
 	struct hist_key *key1 = (struct hist_key *)val1;
 	struct hist_key *key2 = (struct hist_key *)val2;
 
-	return (int)key1->hook - key2->hook;
+	if (key1->hook != key2->hook)
+		return (int)key1->hook - key2->hook;
+
+	return strncmp(key1->comm, key2->comm, sizeof(key1->comm));
 }
 
 static int insert_last_hist_sorted(size_t nhists,
@@ -731,6 +741,7 @@ static int fetch_histograms(int map_fd, size_t *nhists, size_t max_hists,
 				sum_percpu_vals(ncpus, percpu_buckets[i]),
 				nhists, max_hists, hists);
 			if (err)
+				// TODO - handle ENOSPC case more robustly
 				goto exit;
 		}
 
@@ -747,7 +758,7 @@ exit:
 
 static int report_stats(const struct netstacklat_bpf *obj)
 {
-	static struct histogram_entry hists[NETSTACKLAT_N_HOOKS] = { 0 };
+	static struct histogram_entry hists[1024] = { 0 };
 	static size_t nhists = 0;
 	int i, err;
 	time_t t;

@@ -16,6 +16,10 @@
 // The highest possible PID on a Linux system (from /include/linux/threads.h)
 #define PID_MAX_LIMIT (4 * 1024 * 1024)
 
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN 16
+#endif
+
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 #endif
@@ -43,12 +47,14 @@ enum netstacklat_hook {
 
 // Key used for the histogram map
 struct hist_key {
+	char comm[TASK_COMM_LEN];
 	__u16 hook; // need known size for ebpf-exporter to decode
 	__u16 bucket; // needs to be last to be compatible with ebpf-exporter
 };
 
 struct netstacklat_bpf_config {
 	bool filter_pid;
+	bool groupby_comm;
 };
 
 #endif
