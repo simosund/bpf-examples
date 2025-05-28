@@ -48,8 +48,8 @@ static const char *__doc__ =
 
 #define MAX_HOOK_PROGS 4
 
-// Maximum number of different pids that can be filtered for
-#define MAX_FILTER_PIDS 4096
+// Maximum number of PIDs to read from user
+#define MAX_PARSED_PIDS 4096
 
 typedef int (*t_parse_val_func)(const char *, void *);
 
@@ -74,7 +74,7 @@ struct netstacklat_config {
 	double report_interval_s;
 	bool enabled_hooks[NETSTACKLAT_N_HOOKS];
 	int npids;
-	__u32 pids[MAX_FILTER_PIDS];
+	__u32 *pids;
 };
 
 static const struct option long_options[] = {
@@ -420,6 +420,10 @@ static int parse_arguments(int argc, char *argv[],
 	conf->npids = 0;
 	conf->bpf_conf.filter_pid = false;
 
+	conf->pids = calloc(MAX_PARSED_PIDS, sizeof(*conf->pids));
+	if (!conf->pids)
+		return -errno;
+
 	for (i = 0; i < NETSTACKLAT_N_HOOKS; i++)
 		// All probes enabled by default
 		conf->enabled_hooks[i] = true;
@@ -464,8 +468,8 @@ static int parse_arguments(int argc, char *argv[],
 				conf->enabled_hooks[i] = !hooks[i];
 			hooks_off = true;
 			break;
-		case 'p': // filter-pids
-			ret = parse_pids(ARRAY_SIZE(conf->pids) - conf->npids,
+		case 'p': // pids
+			ret = parse_pids(MAX_PARSED_PIDS - conf->npids,
 					 conf->pids + conf->npids, optarg);
 			if (ret < 0)
 				return ret;
