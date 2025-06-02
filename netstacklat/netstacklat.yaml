@@ -25,3 +25,9 @@ metrics:
           decoders:
             - name: uint
 
+cgroup_id_map:
+  name: netstack_cgroupfilter
+  type: hash
+  regexps:
+    - ^.*(system.slice/.*)$
+
