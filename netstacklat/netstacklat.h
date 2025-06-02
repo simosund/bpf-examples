@@ -17,6 +17,8 @@
 #define PID_MAX_LIMIT (4 * 1024 * 1024)
 // The highest ifindex we expect to encounter
 #define IFINDEX_MAX 16384
+// The maximum number of different cgroups we can filter for
+#define MAX_TRACKED_CGROUPS 4096
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
@@ -57,6 +59,7 @@ struct netstacklat_bpf_config {
 	__u32 network_ns;
 	bool filter_pid;
 	bool filter_ifindex;
+	bool filter_cgroup;
 };
 
 #endif
