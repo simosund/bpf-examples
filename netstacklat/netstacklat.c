@@ -96,6 +96,7 @@ static const struct option long_options[] = {
 	{ "interfaces",        required_argument, NULL, 'i' },
 	{ "network-namespace", required_argument, NULL, 'n' },
 	{ "cgroups",           required_argument, NULL, 'c' },
+	{ "nonempty-queue",    no_argument,       NULL, 'q' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -560,6 +561,7 @@ static int parse_arguments(int argc, char *argv[],
 	conf->nifindices = 0;
 	conf->bpf_conf.filter_pid = false;
 	conf->bpf_conf.filter_ifindex = false;
+	conf->bpf_conf.filter_nonempty_sockqueue = false;
 
 	conf->pids = calloc(MAX_PARSED_PIDS, sizeof(*conf->pids));
 	conf->ifindices = calloc(MAX_PARSED_IFACES, sizeof(*conf->ifindices));
@@ -646,6 +648,9 @@ static int parse_arguments(int argc, char *argv[],
 
 			conf->ncgroups += ret;
 			conf->bpf_conf.filter_cgroup = true;
+			break;
+		case 'q': // nonempty-queue
+			conf->bpf_conf.filter_nonempty_sockqueue = true;
 			break;
 		case 'h': // help
 			print_usage(stdout, argv[0]);
