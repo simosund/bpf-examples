@@ -33,6 +33,15 @@
 	})
 #endif
 
+#ifndef min
+#define min(a, b)                   \
+	({                          \
+		typeof(a) _a = (a); \
+		typeof(b) _b = (b); \
+		_a < _b ? _a : _b;  \
+	})
+#endif
+
 enum netstacklat_hook {
 	NETSTACKLAT_HOOK_INVALID = 0,
 	NETSTACKLAT_HOOK_IP_RCV,
@@ -51,6 +60,7 @@ enum netstacklat_hook {
  * member is named "bucket" and is the histogram bucket index.
  */
 struct hist_key {
+	__u32 ifindex;
 	__u16 hook; // need well defined size for ebpf-exporter to decode
 	__u16 bucket; // needs to be last to be compatible with ebpf-exporter
 };
@@ -61,6 +71,7 @@ struct netstacklat_bpf_config {
 	bool filter_ifindex;
 	bool filter_cgroup;
 	bool filter_nonempty_sockqueue;
+	bool groupby_ifindex;
 };
 
 #endif
