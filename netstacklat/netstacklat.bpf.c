@@ -18,6 +18,7 @@ volatile const struct netstacklat_bpf_config user_config = {
 	.filter_pid = false,
 	.filter_ifindex = false,
 	.filter_cgroup = false,
+	.filter_nonempty_sockqueue = false,
 };
 
 /*
@@ -261,10 +262,34 @@ static bool filter_current_task(void)
 	return ok;
 }
 
+/**
+ * skb_queue_empty - check if a queue is empty
+ * @list: queue head
+ *
+ * Returns true if the queue is empty, false otherwise.
+ *
+ * Copied from /include/linux/skbuff.h
+ */
+static inline int skb_queue_empty(const struct sk_buff_head *list)
+{
+	return list->next == (const struct sk_buff *)list;
+}
+
+static bool filter_nonempty_sockqueue(struct sock *sk)
+{
+	if (!user_config.filter_nonempty_sockqueue)
+		return true;
+
+	return !skb_queue_empty(&sk->sk_receive_queue);
+}
+
 static void record_socket_latency(struct sock *sk, struct sk_buff *skb,
 				  ktime_t tstamp, enum netstacklat_hook hook)
 {
 	u32 ifindex;
+
+	if (!filter_nonempty_sockqueue(sk))
+		return;
 
 	if (!filter_current_task())
 		return;

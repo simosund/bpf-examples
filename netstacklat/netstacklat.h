@@ -60,6 +60,7 @@ struct netstacklat_bpf_config {
 	bool filter_pid;
 	bool filter_ifindex;
 	bool filter_cgroup;
+	bool filter_nonempty_sockqueue;
 };
 
 #endif
