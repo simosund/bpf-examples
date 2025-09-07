@@ -72,6 +72,7 @@ struct hist_key {
 struct netstacklat_bpf_config {
 	__u32 network_ns;
 	__u32 filter_min_sockqueue_len;
+	__u64 filter_nth_packet;
 	bool filter_pid;
 	bool filter_ifindex;
 	bool filter_cgroup;

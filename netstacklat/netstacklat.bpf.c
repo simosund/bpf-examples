@@ -18,6 +18,7 @@ volatile const __s64 TAI_OFFSET = (37LL * NS_PER_S);
 volatile const struct netstacklat_bpf_config user_config = {
 	.network_ns = 0,
 	.filter_min_sockqueue_len = 0, /* zero means filter is inactive */
+	.filter_nth_packet = 0, /* reduce recorded event to every nth packet, use power-of-2 */
 	.filter_pid = false,
 	.filter_ifindex = false,
 	.filter_cgroup = false,
@@ -65,6 +66,14 @@ struct {
 	__type(key, u64);
 	__type(value, u64);
 } netstack_cgroupfilter SEC(".maps");
+
+/* Per-CPU counter for down sampling the recorded events to every nth event */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, NETSTACKLAT_N_HOOKS);
+	__type(key, u32);
+	__type(value, u64);
+} netstack_nth_filter SEC(".maps");
 
 static u64 *lookup_or_zeroinit_histentry(void *map, const struct hist_key *key)
 {
@@ -152,6 +161,31 @@ static void record_latency_since(ktime_t tstamp, const struct hist_key *key)
 		record_latency(latency, key);
 }
 
+static inline bool filter_nth_packet(const enum netstacklat_hook hook)
+{
+	u32 key = hook;
+	u64 pkt_cnt;
+	u64 *nth;
+
+	/* Zero and one means disabled */
+	if (user_config.filter_nth_packet <= 1)
+		return true;
+
+	nth = bpf_map_lookup_elem(&netstack_nth_filter, &key);
+	if (!nth)
+		return false;
+
+	/* The hooks (like tcp-socket-read) runs outside the socket lock in a
+	 * preempt/migrate-able user context. Thus, atomic updates are needed
+	 * for correctness, but keep PERCPU map to limit cache-line bouncing.
+	 */
+	pkt_cnt = __sync_fetch_and_add(nth, 1);
+	if ((pkt_cnt % user_config.filter_nth_packet) == 0) {
+		return true;
+	}
+	return false;
+}
+
 static bool filter_ifindex(u32 ifindex)
 {
 	u64 *ifindex_ok;
@@ -222,6 +256,9 @@ static void record_skb_latency(struct sk_buff *skb, struct sock *sk, enum netsta
 		return;
 
 	if (!filter_network_ns(skb, sk))
+		return;
+
+	if (!filter_nth_packet(hook))
 		return;
 
 	if (user_config.groupby_ifindex)
@@ -321,6 +358,9 @@ static void record_socket_latency(struct sock *sk, struct sk_buff *skb,
 		return;
 
 	if (!filter_network_ns(skb, sk))
+		return;
+
+	if (!filter_nth_packet(hook))
 		return;
 
 	if (user_config.groupby_ifindex)
