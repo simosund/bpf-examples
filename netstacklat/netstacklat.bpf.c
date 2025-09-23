@@ -10,6 +10,8 @@
 #include "bits.bpf.h"
 
 #define READ_ONCE(x) (*(volatile typeof(x) *)&(x))
+#define tcp_sk(ptr) container_of(ptr, struct tcp_sock, inet_conn.isck_inet.sk)
+#define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -38,6 +40,12 @@ struct sk_buff___old {
 	__u8 mono_delivery_time: 1;
 } __attribute__((preserve_access_index));
 
+struct tcp_sock_ooo_range {
+	u32 seq_start;
+	u32 seq_end;
+	bool active;
+}
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__uint(max_entries, HIST_NBUCKETS * NETSTACKLAT_N_HOOKS * 64);
@@ -65,6 +73,13 @@ struct {
 	__type(key, u64);
 	__type(value, u64);
 } netstack_cgroupfilter SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(max_entries, 0);
+	__type(key, u32);
+	__type(value, struct tcp_sock_ooo_range);
+} netstack_tcp_ooo SEC(".maps");
 
 static u64 *lookup_or_zeroinit_histentry(void *map, const struct hist_key *key)
 {
@@ -396,6 +411,11 @@ int BPF_PROG(netstacklat_tcp_recv_timestamp, void *msg, struct sock *sk,
 	     struct scm_timestamping_internal *tss)
 {
 	struct timespec64 *ts = &tss->ts[0];
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	// Alternative - filter on empty out_of_order_queue here
+	if (tcp_read_in_ooo_range(sk))
+		return 0;
 	record_socket_latency(sk, NULL,
 			      (ktime_t)ts->tv_sec * NS_PER_S + ts->tv_nsec,
 			      NETSTACKLAT_HOOK_TCP_SOCK_READ);
@@ -408,5 +428,34 @@ int BPF_PROG(netstacklat_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 {
 	record_socket_latency(sk, skb, skb->tstamp,
 			      NETSTACKLAT_HOOK_UDP_SOCK_READ);
+	return 0;
+}
+
+// This program should also be disabled if tcp-socket-read is disabled
+SEC("fentry/tcp_data_queue_ofo")
+int BPF_PROG(netstacklat_tcp_data_queue_ofo, struct sock *sk,
+	     struct sk_buff *skb)
+{
+	// Refactor this into tcp_sock_record_ooo_range()
+	//struct tcp_sock *tp = tcp_sk(sk);
+	//struct tcp_skb_cb *tcp_cb = &skb->cb[0];
+	struct tcp_sock_ooo_range *tp_ooo_range;
+
+	tp_ooo_range = bpf_sk_storage_get(&netstack_tcp_ooo, sk, NULL,
+					  BPF_SK_STORAGE_GET_F_CREATE);
+	if (!tp_ooo_range)
+		return 0;
+
+	if (tp_ooo_range->active) {
+		if (u32_lt(TCP_SKB_CB(skb)->seq, tp_ooo_range->seq_start))
+			tp_ooo_range->seq_start = TCP_SKB_CB(skb)->seq;
+		if (u32_gt(TCP_SKB_CB(skb)->seq_end, tp_ooo_range->seq_end))
+			tp_ooo_range->seq_end = TCP_SKB_CB(skb)->seq_end;
+	} else {
+		tp_ooo_range->seq_start = TCP_SKB_CB(skb)->seq;
+		tp_ooo_range->seq_end = TCP_SKB_CB(skb)->seq_end;
+		tp_ooo_range->active = true;
+	}
+
 	return 0;
 }
